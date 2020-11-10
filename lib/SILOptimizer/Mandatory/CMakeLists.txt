@@ -11,7 +11,9 @@ target_sources(swiftSILOptimizer PRIVATE
   DiagnoseInvalidEscapingCaptures.cpp
   DiagnoseStaticExclusivity.cpp
   DiagnoseUnreachable.cpp
+  DiagnoseVarUsage.cpp
   Differentiation.cpp
+  DVUMemoryUseCollector.cpp
   IRGenPrepare.cpp
   MandatoryInlining.cpp
   NestedSemanticFunctionCheck.cpp

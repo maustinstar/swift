@@ -3189,9 +3189,9 @@ void VarDeclUsageChecker::handleIfConfig(IfConfigDecl *ICD) {
 /// code declarations that haven't been checked yet.
 void swift::
 performTopLevelDeclDiagnostics(TopLevelCodeDecl *TLCD) {
-  auto &ctx = TLCD->getDeclContext()->getASTContext();
-  VarDeclUsageChecker checker(TLCD, ctx.Diags);
-  TLCD->walk(checker);
+//  auto &ctx = TLCD->getDeclContext()->getASTContext();
+//  VarDeclUsageChecker checker(TLCD, ctx.Diags);
+//  TLCD->walk(checker);
 }
 
 /// Perform diagnostics on closure body.
@@ -3203,9 +3203,9 @@ void swift::performClosureBodyDiagnostics(ClosureExpr *closure) {
       return;
     }
   }
-  auto &ctx = closure->getASTContext();
-  VarDeclUsageChecker checker(closure, ctx.Diags);
-  closure->walk(checker);
+//  auto &ctx = closure->getASTContext();
+//  VarDeclUsageChecker checker(closure, ctx.Diags);
+//  closure->walk(checker);
 }
 
 /// Perform diagnostics for func/init/deinit declarations.
@@ -3217,11 +3217,11 @@ void swift::performAbstractFuncDeclDiagnostics(AbstractFunctionDecl *AFD) {
   // Check for unused variables, as well as variables that are could be
   // declared as constants. Skip local functions though, since they will
   // be checked as part of their parent function or TopLevelCodeDecl.
-  if (!AFD->getDeclContext()->isLocalContext()) {
-    auto &ctx = AFD->getDeclContext()->getASTContext();
-    VarDeclUsageChecker checker(AFD, ctx.Diags);
-    AFD->walk(checker);
-  }
+//  if (!AFD->getDeclContext()->isLocalContext()) {
+//    auto &ctx = AFD->getDeclContext()->getASTContext();
+//    VarDeclUsageChecker checker(AFD, ctx.Diags);
+//    AFD->walk(checker);
+//  }
 
   auto *body = AFD->getBody();
 
