@@ -3610,7 +3610,7 @@ internal func _instantiateKeyPathBuffer(
   _ arguments: UnsafeRawPointer
 ) {
   let destHeaderPtr = origDestData.baseAddress.unsafelyUnwrapped
-  var destData = UnsafeMutableRawBufferPointer(
+  let destData = UnsafeMutableRawBufferPointer(
     start: destHeaderPtr.advanced(by: MemoryLayout<Int>.size),
     count: origDestData.count - MemoryLayout<Int>.size)
 
