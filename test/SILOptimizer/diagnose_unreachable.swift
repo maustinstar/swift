@@ -63,7 +63,7 @@ func testQuestionMarkOperator() -> Int {
 func userCode() {}
 
 func whileTrue() {
-  var x = 0
+  var x = 0 // expected-warning {{variable 'x' was written to, but never read}}
   while true { // expected-note {{always evaluates to true}}
     x += 1
   }
@@ -76,7 +76,7 @@ func whileTrueSilent() {
 }   // no warning!
 
 func whileTrueReachable(_ v: Int) -> () {
-  var x = 0
+  var x = 0 // expected-warning {{variable 'x' was written to, but never read}}
   while true {
     if v == 0 {
       break
@@ -87,7 +87,7 @@ func whileTrueReachable(_ v: Int) -> () {
 }
 
 func whileTrueTwoPredecessorsEliminated() -> () {
-  var x = 0
+  var x = 0 // expected-warning {{variable 'x' was written to, but never read}}
   while (true) { // expected-note {{always evaluates to true}}
     if false {
       break
