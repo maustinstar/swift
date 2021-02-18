@@ -1,7 +1,9 @@
 # Differentiable Programming Manifesto
 
 *   Authors: [Richard Wei], [Dan Zheng], [Marc Rasi], [Bart Chrzaszcz]
-*   Status: Partially implemented on master, feature gated under `import _Differentiation`
+*   Status:
+    * Partially implemented on main, feature gated under `import _Differentiation`
+    * Initial proposal [pitched](https://forums.swift.org/t/differentiable-programming-for-gradient-based-machine-learning/42147) with a significantly scoped-down subset of features. Please refer to the linked pitch thread for the latest design discussions and changes.
 
 ## Table of contents
 
@@ -984,44 +986,6 @@ public protocol Differentiable {
     /// equivalent to exponential map, which moves `self` on the geodesic
     /// surface along the given tangent vector.
     mutating func move(along direction: TangentVector)
-    
-    /// A closure that produces a zero tangent vector and does not capture `self`.
-    ///
-    /// In some cases, the zero tangent vector of `self` is equal to
-    /// `TangentVector.zero`. In other cases, the zero tangent vector depends on
-    /// information in `self`, such as shape for an n-dimensional array type.
-    /// For differentiable programming, it is more memory-efficient to define a
-    /// custom `zeroTangentVectorInitializer` property which returns a closure
-    /// that captures and uses only the necessary information to create a zero
-    /// tangent vector. For example:
-    ///
-    /// ```swift
-    /// struct Vector {
-    ///     var scalars: [Float]
-    ///     var count: Int { scalars.count }
-    ///     init(repeating repeatedElement: Float, count: Int) { ... }
-    /// }
-    /// 
-    /// extension Vector: Differentiable {
-    ///     typealias TangentVector = Vector
-    ///
-    ///     @noDerivative
-    ///     var zeroTangentVectorInitializer: () -> TangentVector {
-    ///         let count = self.count
-    ///         return { TangentVector(repeating: 0, count: count) }
-    ///     }
-    /// }
-    /// ```
-    ///
-    @noDerivative
-    var zeroTangentVectorInitializer: () -> TangentVector { get }
-}
-
-extension Differentiable {
-    /// A tangent vector such that `move(along: zeroTangentVector)` will not modify
-    /// `self`.
-    @noDerivative
-    var zeroTangentVector: TangentVector { zeroTangentVectorInitializer() }
 }
 ```
 
@@ -1090,13 +1054,6 @@ public extension Differentiable where Self == TangentVector {
 }
 ```
 
-The `zeroTangentVector` property returns a tangent vector such that calling
-`move(along:)` on the vector will not modify `self`. A zero tangent vector is
-often used in the initialization of mathematical optimization, where tangent
-vectors are initially zero and modified iteratively. This property may be
-different from `TangentVector.zero` because some tangent vectors depend on
-instance properties of `self`, e.g. the `count` property in `Array`.
-
 #### `Differentiable` conformances
 
 Conforming a type to `Differentiable` tells Swift that changes in values of this
@@ -1144,13 +1101,6 @@ extension Array: Differentiable where Element: Differentiable {
             self[i].move(along: Element.TangentVector(direction.elements[i]))
         }
     }
-
-    @noDerivative
-    public var zeroTangentVectorInitializer: () -> TangentVector {
-        { [zeroInits = map(\.zeroTangentVectorInitializer)] in
-            TangentVector(zeroInits.map { $0() })
-        }
-    }
 }
 
 // struct Dictionary<Key: Hashable, Value>
@@ -1171,14 +1121,6 @@ extension Dictionary: Differentiable where Value: Differentiable {
             self[i].move(along: Value.TangentVector(direction.elements[i]))
         }
     }
-
-    @noDerivative
-    public var zeroTangentVectorInitializer: () -> TangentVector {
-        { [keys = self.keys] in
-            let pairs = zip(keys, sequence(first: .zero, next: {$0}))
-            return TangentVector(Dictionary(uniqueKeysWithValues: pairs))
-        }
-    }
 }
 
 // enum Optional<Wrapped>
@@ -1195,18 +1137,6 @@ extension Optional: Differentiable where Wrapped: Differentiable {
     public mutating func move(along direction: TangentVector) {
         if let value = direction.value {
             self?.move(along: value)
-        }
-    }
-
-    @noDerivative
-    public var zeroTangentVectorInitializer: () -> TangentVector {
-        switch self {
-        case nil:
-            return { TangentVector(nil) }
-        case let x?:
-            return { [zeroTanInit = x.zeroTangentVectorInitializer] in
-                TangentVector(zeroTanInit())
-            }
         }
     }
 }
@@ -1259,26 +1189,25 @@ product manifold of the manifolds each differentiable variable's type
 represents. Differentiable variables' types are required to conform to
 `Differentiable` because the synthesized implementation needs to access each
 differentiable variable's type's `TangentVector` associated type and invoke each
-differentiable variable's implementation of `move(along:)` and
-`zeroTangentVectorInitializer`. Because the synthesized implementation needs to
-invoke `move(along:)` on each differentiable variable, the differentiable
-variables must have a `move(along:)` which satisfies the protocol requirement
-and can be invoked on the property. That is, the property must be either a
-variable (`var`) or a constant (`let`) with a non-`mutating` implementation of
-the `move(along:)` protocol requirement.
+differentiable variable's implementation of `move(along:)`. Because the
+synthesized implementation needs to invoke `move(along:)` on each differentiable
+variable, the differentiable variables must have a `move(along:)` which satisfies the
+protocol requirement and can be invoked on the property. That is, the property
+must be either a variable (`var`) or a constant (`let`) with a non-`mutating`
+implementation of the `move(along:)` protocol requirement.
 
 The synthesized `TangentVector` has the same effective access level as the
 original type declaration. Properties in the synthesized `TangentVector` have
 the same effective access level as their corresponding original properties.
 
+The synthesized `TangentVector` adopts protocols from all `TangentVector`
+conformance constraints implied by the declaration that triggers synthesis. For
+example, synthesized `TangentVector`s always adopt the `AdditiveArithmetic` and
+`Differentiable` protocols because the `Differentiable` protocol requires that
+`TangentVector` conforms to `AdditiveArithmetic` and `Differentiable`.
+
 The synthesized `move(along:)` method calls `move(along:)` for each pair of a
 differentiable variable and its corresponding property in `TangentVector`.
-
-The synthesized `zeroTangentVectorInitializer` property returns a closure that
-captures and calls each stored property's `zeroTangentVectorInitializer`
-closure. When memberwise derivation is not possible (e.g. for custom
-user-defined `TangentVector` types), `zeroTangentVectorInitializer` is
-synthesized as a `{ TangentVector.zero }` closure.
 
 ```swift
 struct Foo<T: Differentiable, U: Differentiable>: @memberwise Differentiable {
@@ -1297,13 +1226,6 @@ struct Foo<T: Differentiable, U: Differentiable>: @memberwise Differentiable {
     //     mutating func move(along direction: TangentVector) {
     //         x.move(along: direction.x)
     //         y.move(along: direction.y)
-    //     }
-    //
-    //     var zeroTangentVectorInitializer: () -> TangentVector {
-    //         { [xTanInit = x.zeroTangentVectorInitializer,
-    //            yTanInit = y.zeroTangentVectorInitializer] in
-    //             TangentVector(x: xTanInit(), y: yTanInit())
-    //         }
     //     }
 }
 ```
@@ -1396,14 +1318,6 @@ struct Point<T: Real>: @memberwise Differentiable, @memberwise AdditiveArithmeti
     // The compiler synthesizes:
     //
     //     typealias TangentVector = Self
-    //
-    //     @noDerivative
-    //     var zeroTangentVectorInitializer: () -> TangentVector {
-    //         { [xTanInit = x.zeroTangentVectorInitializer,
-    //            yTanInit = y.zeroTangentVectorInitializer] in
-    //             TangentVector(x: xTanInit(), y: yTanInit())
-    //         }
-    //     }
 }
 ```
 
@@ -1877,9 +1791,9 @@ Since complex numbers are not yet defined in the standard library, we extended
 the complex number type defined in the
 [NumericAnnex](https://github.com/xwu/NumericAnnex) library to be
 differentiable.
-[The full implementation is here](https://github.com/tensorflow/swift-apis/blob/master/Sources/third_party/Experimental/Complex.swift).
+[The full implementation is here](https://github.com/tensorflow/swift-apis/blob/main/Sources/third_party/Experimental/Complex.swift).
 The implementation adopts the
-[Autograd convention](https://github.com/HIPS/autograd/blob/master/docs/tutorial.md#complex-numbers)
+[Autograd convention](https://github.com/HIPS/autograd/blob/main/docs/tutorial.md#complex-numbers)
 for derivatives of functions with complex arguments or results, so that we can
 define derivatives for non-holomorphic primitives.
 
@@ -2098,7 +2012,7 @@ func foo<T: Differentiable, U, V: Differentiable>(
 ##### Examples
 
 The `ElementaryFunctions` protocol introduced in
-[SE-0246](https://github.com/apple/swift-evolution/blob/master/proposals/0246-mathable.md)
+[SE-0246](https://github.com/apple/swift-evolution/blob/main/proposals/0246-mathable.md)
 defines generic elementary functions, which are non-linear. By defining
 derivatives using the `@derivative` attribute for these protocol
 requirements in an extension, all conforming types now have differentiable
@@ -3194,7 +3108,7 @@ Parker Schuh, and Dimitrios Vytiniotis.
 [Bart Chrzaszcz]: https://github.com/bartchr808
 
 [swift-numerics]: https://github.com/apple/swift-numerics
-[SE-0229]: https://github.com/apple/swift-evolution/blob/master/proposals/0229-simd.md
-[SE-0233]: https://github.com/apple/swift-evolution/blob/master/proposals/0233-additive-arithmetic-protocol.md
-[SE-0246]: https://github.com/apple/swift-evolution/blob/master/proposals/0246-mathable.md
-[SE-0251]: https://github.com/apple/swift-evolution/blob/master/proposals/0251-simd-additions.md
+[SE-0229]: https://github.com/apple/swift-evolution/blob/main/proposals/0229-simd.md
+[SE-0233]: https://github.com/apple/swift-evolution/blob/main/proposals/0233-additive-arithmetic-protocol.md
+[SE-0246]: https://github.com/apple/swift-evolution/blob/main/proposals/0246-mathable.md
+[SE-0251]: https://github.com/apple/swift-evolution/blob/main/proposals/0251-simd-additions.md

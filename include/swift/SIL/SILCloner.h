@@ -67,9 +67,6 @@ private:
   // convenient way to iterate over the cloned region.
   SmallVector<SILBasicBlock *, 8> preorderBlocks;
 
-  /// Set of basic blocks where unreachable was inserted.
-  SmallPtrSet<SILBasicBlock *, 32> BlocksWithUnreachables;
-
   // Keep track of the last cloned block in function order. For single block
   // regions, this will be the start block.
   SILBasicBlock *lastClonedBB = nullptr;
@@ -97,7 +94,6 @@ public:
     ValueMap.clear();
     BBMap.clear();
     preorderBlocks.clear();
-    BlocksWithUnreachables.clear();
   }
 
   /// Clients of SILCloner who want to know about any newly created
@@ -168,12 +164,6 @@ public:
   /// value to another value for use within the cloned region.
   void recordFoldedValue(SILValue origValue, SILValue mappedValue) {
     asImpl().mapValue(origValue, mappedValue);
-  }
-
-  /// Mark a block containing an unreachable instruction for use in the `fixUp`
-  /// callback.
-  void addBlockWithUnreachable(SILBasicBlock *BB) {
-    BlocksWithUnreachables.insert(BB);
   }
 
   /// Register a re-mapping for opened existentials.
@@ -787,32 +777,6 @@ SILCloner<ImplClass>::doFixUp(SILFunction *F) {
     }
   }
 
-  // Remove any code after unreachable instructions.
-
-  // NOTE: It is unfortunate that it essentially duplicates the code from
-  // sil-combine, but doing so allows for avoiding any cross-layer invocations
-  // between SIL and SILOptimizer layers.
-
-  for (auto *BB : BlocksWithUnreachables) {
-    for (auto &I : *BB) {
-      if (!isa<UnreachableInst>(&I))
-        continue;
-
-      // Collect together all the instructions after this point
-      llvm::SmallVector<SILInstruction *, 32> ToRemove;
-      for (auto Inst = BB->rbegin(); &*Inst != &I; ++Inst)
-        ToRemove.push_back(&*Inst);
-
-      for (auto *Inst : ToRemove) {
-        // Replace any non-dead results with SILUndef values
-        Inst->replaceAllUsesOfAllResultsWithUndef();
-        Inst->eraseFromParent();
-      }
-    }
-  }
-
-  BlocksWithUnreachables.clear();
-
   // Call any cleanup specific to the CRTP extensions.
   asImpl().fixUp(F);
 }
@@ -1003,7 +967,7 @@ template<typename ImplClass>
 void
 SILCloner<ImplClass>::visitFunctionRefInst(FunctionRefInst *Inst) {
   SILFunction *OpFunction =
-      getOpFunction(Inst->getInitiallyReferencedFunction());
+      getOpFunction(Inst->getReferencedFunction());
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
   recordClonedInstruction(Inst, getBuilder().createFunctionRef(
                                     getOpLocation(Inst->getLoc()), OpFunction));
@@ -1287,9 +1251,9 @@ void
 SILCloner<ImplClass>::visitMarkUninitializedInst(MarkUninitializedInst *Inst) {
   SILValue OpValue = getOpValue(Inst->getOperand());
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  recordClonedInstruction(
-      Inst, getBuilder().createMarkUninitialized(getOpLocation(Inst->getLoc()),
-                                                 OpValue, Inst->getKind()));
+  recordClonedInstruction(Inst, getBuilder().createMarkUninitialized(
+                                    getOpLocation(Inst->getLoc()), OpValue,
+                                    Inst->getMarkUninitializedKind()));
 }
 
 template<typename ImplClass>
@@ -2389,8 +2353,8 @@ void SILCloner<ImplClass>::visitUncheckedOwnershipConversionInst(
 
   ValueOwnershipKind Kind = SILValue(Inst).getOwnershipKind();
   if (getOpValue(Inst->getOperand()).getOwnershipKind() ==
-      ValueOwnershipKind::None) {
-    Kind = ValueOwnershipKind::None;
+      OwnershipKind::None) {
+    Kind = OwnershipKind::None;
   }
   recordClonedInstruction(Inst, getBuilder().createUncheckedOwnershipConversion(
                                     getOpLocation(Inst->getLoc()),
@@ -2961,7 +2925,8 @@ void SILCloner<ImplClass>
   recordClonedInstruction(Inst,
                           getBuilder().createGetAsyncContinuation(
                             getOpLocation(Inst->getLoc()),
-                            getOpType(Inst->getType())));
+                            getOpASTType(Inst->getFormalResumeType()),
+                            Inst->throws()));
 }
 
 template <typename ImplClass>
@@ -2972,7 +2937,8 @@ void SILCloner<ImplClass>
                           getBuilder().createGetAsyncContinuationAddr(
                             getOpLocation(Inst->getLoc()),
                             getOpValue(Inst->getOperand()),
-                            getOpType(Inst->getType())));
+                            getOpASTType(Inst->getFormalResumeType()),
+                            Inst->throws()));
 }
 
 template <typename ImplClass>

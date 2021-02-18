@@ -213,11 +213,6 @@ protected:
     CS.CG.addConstraint(constraint);
   }
 
-  const llvm::MapVector<ConstraintLocator *, SelectedOverload> &
-  getResolvedOverloads() const {
-    return CS.ResolvedOverloads;
-  }
-
   void recordDisjunctionChoice(ConstraintLocator *disjunctionLocator,
                                unsigned index) const {
     CS.recordDisjunctionChoice(disjunctionLocator, index);
@@ -318,7 +313,7 @@ public:
     : SolverStep(cs, allPartialSolutions[index]), Constraints(constraints),
       Index(index), Component(std::move(component)),
       AllPartialSolutions(allPartialSolutions) {
-    assert(!Component.dependsOn.empty() && "Should use ComponentStep");
+    assert(!Component.getDependencies().empty() && "Should use ComponentStep");
     injectConstraints();
   }
 
@@ -426,7 +421,7 @@ public:
       Constraints->push_back(constraint);
     }
 
-    assert(component.dependsOn.empty());
+    assert(component.getDependencies().empty());
   }
 
   /// Create a component step that composes existing partial solutions before
@@ -442,7 +437,8 @@ public:
           Constraints(constraints),
           DependsOnPartialSolutions(std::move(dependsOnPartialSolutions)) {
     TypeVars = component.typeVars;
-    assert(DependsOnPartialSolutions.size() == component.dependsOn.size());
+    assert(DependsOnPartialSolutions.size() ==
+           component.getDependencies().size());
 
     for (auto constraint : component.getConstraints()) {
       constraints->erase(constraint);
@@ -483,9 +479,9 @@ private:
 template <typename P> class BindingStep : public SolverStep {
   using Scope = ConstraintSystem::SolverScope;
 
+protected:
   P Producer;
 
-protected:
   /// Indicates whether any of the attempted bindings
   /// produced a solution.
   bool AnySolved = false;
@@ -569,14 +565,10 @@ protected:
 };
 
 class TypeVariableStep final : public BindingStep<TypeVarBindingProducer> {
-  using BindingContainer = ConstraintSystem::PotentialBindings;
-  using Binding = ConstraintSystem::PotentialBinding;
+  using BindingContainer = inference::PotentialBindings;
+  using Binding = inference::PotentialBinding;
 
   TypeVariableType *TypeVar;
-  // A set of the initial bindings to consider, which is
-  // also a source of follow-up "computed" bindings such
-  // as supertypes, defaults etc.
-  SmallVector<Binding, 4> InitialBindings;
 
   /// Indicates whether source of one of the previously
   /// attempted bindings was a literal constraint. This
@@ -585,10 +577,10 @@ class TypeVariableStep final : public BindingStep<TypeVarBindingProducer> {
   bool SawFirstLiteralConstraint = false;
 
 public:
-  TypeVariableStep(ConstraintSystem &cs, BindingContainer &bindings,
+  TypeVariableStep(BindingContainer &bindings,
                    SmallVectorImpl<Solution> &solutions)
-      : BindingStep(cs, {cs, bindings}, solutions), TypeVar(bindings.TypeVar),
-        InitialBindings(bindings.Bindings.begin(), bindings.Bindings.end()) {}
+      : BindingStep(bindings.CS, {bindings}, solutions),
+        TypeVar(bindings.TypeVar) {}
 
   void setup() override;
 
@@ -597,8 +589,7 @@ public:
   void print(llvm::raw_ostream &Out) override {
     PrintOptions PO;
     PO.PrintTypesForDebugging = true;
-    Out << "TypeVariableStep for " << TypeVar->getString(PO) << " with #"
-        << InitialBindings.size() << " initial bindings\n";
+    Out << "TypeVariableStep for " << TypeVar->getString(PO) << '\n';
   }
 
 protected:
@@ -692,6 +683,20 @@ private:
   bool shortCircuitDisjunctionAt(Constraint *currentChoice,
                                  Constraint *lastSuccessfulChoice) const;
 
+  bool shouldSkipGenericOperators() const {
+    if (!BestNonGenericScore)
+      return false;
+
+    // Let's skip generic overload choices only in case if
+    // non-generic score indicates that there were no forced
+    // unwrappings of optional(s), no unavailable overload
+    // choices present in the solution, no fixes required,
+    // and there are no non-trivial function conversions.
+    auto &score = BestNonGenericScore->Data;
+    return (score[SK_ForceUnchecked] == 0 && score[SK_Unavailable] == 0 &&
+            score[SK_Fix] == 0 && score[SK_FunctionConversion] == 0);
+  }
+
   /// Attempt to apply given disjunction choice to constraint system.
   /// This action is going to establish "active choice" of this disjunction
   /// to point to a given choice.
@@ -716,8 +721,8 @@ private:
     if (!repr || repr == typeVar)
       return;
 
-    for (auto elt : getResolvedOverloads()) {
-      auto resolved = elt.second;
+    for (auto overload : CS.getResolvedOverloads()) {
+      auto resolved = overload.second;
       if (!resolved.boundType->isEqual(repr))
         continue;
 
@@ -741,7 +746,9 @@ private:
 
   // Figure out which of the solutions has the smallest score.
   static Optional<Score> getBestScore(SmallVectorImpl<Solution> &solutions) {
-    assert(!solutions.empty());
+    if (solutions.empty())
+      return None;
+
     Score bestScore = solutions.front().getFixedScore();
     if (solutions.size() == 1)
       return bestScore;

@@ -167,6 +167,9 @@ void SILModule::checkForLeaks() const {
 }
 
 void SILModule::checkForLeaksAfterDestruction() {
+// Disabled in release (non-assert) builds because this check fails in rare
+// cases in lldb, causing crashes. rdar://70826934
+#ifndef NDEBUG
   int numAllocated = SILInstruction::getNumCreatedInstructions() -
                      SILInstruction::getNumDeletedInstructions();
 
@@ -174,6 +177,7 @@ void SILModule::checkForLeaksAfterDestruction() {
     llvm::errs() << "Leaking " << numAllocated << " instructions!\n";
     llvm_unreachable("leaking instructions");
   }
+#endif
 }
 
 std::unique_ptr<SILModule> SILModule::createEmptyModule(
@@ -316,6 +320,7 @@ SILModule::createDefaultWitnessTableDeclaration(const ProtocolDecl *Protocol,
 void SILModule::deleteWitnessTable(SILWitnessTable *Wt) {
   auto Conf = Wt->getConformance();
   assert(lookUpWitnessTable(Conf, false) == Wt);
+  getSILLoader()->invalidateWitnessTable(Wt);
   WitnessTableMap.erase(Conf);
   witnessTables.erase(Wt);
 }
@@ -366,10 +371,6 @@ const BuiltinInfo &SILModule::getBuiltinInfo(Identifier ID) {
     Info.ID = BuiltinValueKind::ApplyDerivative;
   else if (OperationName.startswith("applyTranspose_"))
     Info.ID = BuiltinValueKind::ApplyTranspose;
-  else if (OperationName.startswith("differentiableFunction_"))
-    Info.ID = BuiltinValueKind::DifferentiableFunction;
-  else if (OperationName.startswith("linearFunction_"))
-    Info.ID = BuiltinValueKind::LinearFunction;
   else
     Info.ID = llvm::StringSwitch<BuiltinValueKind>(OperationName)
 #define BUILTIN(id, name, attrs) .Case(name, BuiltinValueKind::id)
@@ -474,7 +475,7 @@ bool SILModule::hasFunction(StringRef Name) {
 }
 
 void SILModule::invalidateSILLoaderCaches() {
-  getSILLoader()->invalidateCaches();
+  getSILLoader()->invalidateAllCaches();
 }
 
 SILFunction *SILModule::removeFromZombieList(StringRef Name) {
@@ -515,9 +516,8 @@ void SILModule::eraseFunction(SILFunction *F) {
 
   // This opens dead-function-removal opportunities for called functions.
   // (References are not needed anymore.)
-  F->dropAllReferences();
+  F->clear();
   F->dropDynamicallyReplacedFunction();
-  F->getBlocks().clear();
   // Drop references for any _specialize(target:) functions.
   F->clearSpecializeAttrs();
 }
@@ -527,9 +527,10 @@ void SILModule::invalidateFunctionInSILCache(SILFunction *F) {
 }
 
 /// Erase a global SIL variable from the module.
-void SILModule::eraseGlobalVariable(SILGlobalVariable *G) {
-  GlobalVariableMap.erase(G->getName());
-  getSILGlobalList().erase(G);
+void SILModule::eraseGlobalVariable(SILGlobalVariable *gv) {
+  getSILLoader()->invalidateGlobalVariable(gv);
+  GlobalVariableMap.erase(gv->getName());
+  getSILGlobalList().erase(gv);
 }
 
 SILVTable *SILModule::lookUpVTable(const ClassDecl *C,
@@ -670,7 +671,8 @@ SILDifferentiabilityWitness *
 SILModule::lookUpDifferentiabilityWitness(SILDifferentiabilityWitnessKey key) {
   Mangle::ASTMangler mangler;
   return lookUpDifferentiabilityWitness(
-      mangler.mangleSILDifferentiabilityWitnessKey(key));
+      mangler.mangleSILDifferentiabilityWitness(
+          key.originalFunctionName, key.kind, key.config));
 }
 
 /// Look up the differentiability witness corresponding to the given indices.

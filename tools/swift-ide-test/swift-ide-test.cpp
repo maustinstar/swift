@@ -737,11 +737,6 @@ static llvm::cl::opt<bool>
                      llvm::cl::desc("Enable C++ interop."),
                      llvm::cl::cat(Category), llvm::cl::init(false));
 
-static llvm::cl::opt<std::string>
-GraphVisPath("output-request-graphviz",
-             llvm::cl::desc("Emit GraphViz output visualizing the request graph."),
-             llvm::cl::cat(Category));
-
 static llvm::cl::opt<bool>
 CanonicalizeType("canonicalize-type", llvm::cl::Hidden,
                    llvm::cl::cat(Category), llvm::cl::init(false));
@@ -2293,7 +2288,8 @@ static int doPrintLocalTypes(const CompilerInvocation &InitInvok,
     for (auto LTD : LocalTypeDecls) {
       Mangle::ASTMangler Mangler;
       std::string MangledName = Mangler.mangleTypeForDebugger(
-          LTD->getDeclaredInterfaceType(), LTD->getDeclContext());
+          LTD->getDeclaredInterfaceType(),
+          LTD->getInnermostDeclContext()->getGenericSignatureOfContext());
       MangledNames.push_back(MangledName);
     }
 
@@ -2515,9 +2511,17 @@ static int doPrintModuleGroups(const CompilerInvocation &InitInvok,
 
 static void printModuleMetadata(ModuleDecl *MD) {
   auto &OS = llvm::outs();
+  OS << "fingerprint=" << MD->getFingerprint().getRawValue() << "\n";
   MD->collectLinkLibraries([&](LinkLibrary lib) {
     OS << "link library: " << lib.getName()
        << ", force load: " << (lib.shouldForceLoad() ? "true" : "false") << "\n";
+  });
+  MD->collectBasicSourceFileInfo([&](const BasicSourceFileInfo &info) {
+    OS << "filepath=" << info.FilePath << "; ";
+    OS << "hash=" << info.InterfaceHash.getRawValue() << "; ";
+    OS << "mtime=" << info.LastModified << "; ";
+    OS << "size=" << info.FileSize;
+    OS << "\n";
   });
 }
 
@@ -2606,6 +2610,14 @@ static int doPrintModules(const CompilerInvocation &InitInvok,
   if (!Stdlib) {
     llvm::errs() << "Failed loading stdlib\n";
     return 1;
+  }
+
+  // If needed, load _Concurrency library so that the Clang importer can use it.
+  if (Context.LangOpts.EnableExperimentalConcurrency) {
+    if (!getModuleByFullName(Context, Context.Id_Concurrency)) {
+      llvm::errs() << "Failed loading _Concurrency library\n";
+      return 1;
+    }
   }
 
   int ExitCode = 0;
@@ -2717,7 +2729,8 @@ static int doPrintSwiftFileInterface(const CompilerInvocation &InitInvok,
   else
     Printer.reset(new StreamPrinter(llvm::outs()));
 
-  PrintOptions Options = PrintOptions::printSwiftFileInterface();
+  PrintOptions Options = PrintOptions::printSwiftFileInterface(
+      InitInvok.getFrontendOptions().PrintFullConvention);
   if (options::PrintOriginalSourceText)
     Options.PrintOriginalSourceText = true;
   printSwiftSourceInterface(*CI.getPrimarySourceFile(), *Printer, Options);
@@ -3276,8 +3289,8 @@ static int doPrintTypeInterface(const CompilerInvocation &InitInvok,
   StreamPrinter Printer(llvm::outs());
   std::string Error;
   std::string TypeName;
-  if (printTypeInterface(SemaT.DC->getParentModule(), SemaT.Ty, Printer,
-                         TypeName, Error)) {
+  if (printTypeInterface(SemaT.ValueD->getDeclContext()->getParentModule(),
+                         SemaT.Ty, Printer, TypeName, Error)) {
     llvm::errs() << Error;
     return 1;
   }
@@ -3405,7 +3418,8 @@ public:
 private:
   void tryDemangleType(Type T, const DeclContext *DC, CharSourceRange range) {
     Mangle::ASTMangler Mangler;
-    std::string mangledName(Mangler.mangleTypeForDebugger(T, DC));
+    auto sig = DC->getGenericSignatureOfContext();
+    std::string mangledName(Mangler.mangleTypeForDebugger(T, sig));
     Type ReconstructedType = DC->mapTypeIntoContext(
         Demangle::getTypeForMangling(Ctx, mangledName));
     Stream << "type: ";
@@ -3822,8 +3836,6 @@ int main(int argc, char *argv[]) {
   InitInvok.setSDKPath(options::SDK);
   InitInvok.getLangOptions().CollectParsedToken = true;
   InitInvok.getLangOptions().BuildSyntaxTree = true;
-  InitInvok.getLangOptions().RequestEvaluatorGraphVizPath =
-    options::GraphVisPath;
   InitInvok.getLangOptions().EnableCrossImportOverlays =
     options::EnableCrossImportOverlays;
   if (options::DisableObjCInterop) {
@@ -3929,7 +3941,8 @@ int main(int argc, char *argv[]) {
 
   PrintOptions PrintOpts;
   if (options::PrintInterface) {
-    PrintOpts = PrintOptions::printModuleInterface();
+    PrintOpts = PrintOptions::printModuleInterface(
+        InitInvok.getFrontendOptions().PrintFullConvention);
   } else if (options::PrintInterfaceForDoc) {
     PrintOpts = PrintOptions::printDocInterface();
   } else {

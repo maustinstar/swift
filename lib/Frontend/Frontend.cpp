@@ -20,7 +20,6 @@
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/FileSystem.h"
-#include "swift/AST/IncrementalRanges.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/FileTypes.h"
@@ -41,6 +40,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
@@ -105,16 +105,6 @@ std::string CompilerInvocation::getReferenceDependenciesFilePathForPrimary(
       .SupplementaryOutputs.ReferenceDependenciesFilePath;
 }
 std::string
-CompilerInvocation::getSwiftRangesFilePathForPrimary(StringRef filename) const {
-  return getPrimarySpecificPathsForPrimary(filename)
-      .SupplementaryOutputs.SwiftRangesFilePath;
-}
-std::string CompilerInvocation::getCompiledSourceFilePathForPrimary(
-    StringRef filename) const {
-  return getPrimarySpecificPathsForPrimary(filename)
-      .SupplementaryOutputs.CompiledSourceFilePath;
-}
-std::string
 CompilerInvocation::getSerializedDiagnosticsPathForAtMostOnePrimary() const {
   return getPrimarySpecificPathsForAtMostOnePrimary()
       .SupplementaryOutputs.SerializedDiagnosticsPath;
@@ -165,6 +155,19 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
     serializationOpts.ImportedHeader = opts.ImplicitObjCHeaderPath;
   serializationOpts.ModuleLinkName = opts.ModuleLinkName;
   serializationOpts.ExtraClangOptions = getClangImporterOptions().ExtraArgs;
+  
+  if (opts.EmitSymbolGraph) {
+    if (!opts.SymbolGraphOutputDir.empty()) {
+      serializationOpts.SymbolGraphOutputDir = opts.SymbolGraphOutputDir;
+    } else {
+      serializationOpts.SymbolGraphOutputDir = serializationOpts.OutputPath;
+    }
+    SmallString<256> OutputDir(serializationOpts.SymbolGraphOutputDir);
+    llvm::sys::fs::make_absolute(OutputDir);
+    llvm::sys::path::remove_filename(OutputDir);
+    serializationOpts.SymbolGraphOutputDir = OutputDir.str().str();
+  }
+  
   if (!getIRGenOptions().ForceLoadSymbolName.empty())
     serializationOpts.AutolinkForceLoad = true;
 
@@ -204,6 +207,11 @@ bool CompilerInstance::setUpASTContextIfNeeded() {
     // ASTContext at this level.
     return false;
   }
+
+  // For the time being, we only need to record dependencies in batch mode
+  // and single file builds.
+  Invocation.getLangOptions().RecordRequestReferences
+    = !isWholeModuleCompilation();
 
   Context.reset(ASTContext::get(
       Invocation.getLangOptions(), Invocation.getTypeCheckerOptions(),
@@ -285,15 +293,31 @@ void CompilerInstance::setupStatsReporter() {
   Stats = std::move(Reporter);
 }
 
-void CompilerInstance::setupDiagnosticVerifierIfNeeded() {
+bool CompilerInstance::setupDiagnosticVerifierIfNeeded() {
   auto &diagOpts = Invocation.getDiagnosticOptions();
+  bool hadError = false;
+
   if (diagOpts.VerifyMode != DiagnosticOptions::NoVerify) {
     DiagVerifier = std::make_unique<DiagnosticVerifier>(
         SourceMgr, InputSourceCodeBufferIDs,
         diagOpts.VerifyMode == DiagnosticOptions::VerifyAndApplyFixes,
         diagOpts.VerifyIgnoreUnknown);
+    for (const auto &filename : diagOpts.AdditionalVerifierFiles) {
+      auto result = getFileSystem().getBufferForFile(filename);
+      if (!result) {
+        Diagnostics.diagnose(SourceLoc(), diag::error_open_input_file,
+                             filename, result.getError().message());
+        hadError |= true;
+      }
+
+      auto bufferID = SourceMgr.addNewSourceBuffer(std::move(result.get()));
+      DiagVerifier->appendAdditionalBufferID(bufferID);
+    }
+
     addDiagnosticConsumer(DiagVerifier.get());
   }
+
+  return hadError;
 }
 
 void CompilerInstance::setupDependencyTrackerIfNeeded() {
@@ -342,7 +366,9 @@ bool CompilerInstance::setup(const CompilerInvocation &Invok) {
     return true;
 
   setupStatsReporter();
-  setupDiagnosticVerifierIfNeeded();
+
+  if (setupDiagnosticVerifierIfNeeded())
+    return true;
 
   return false;
 }
@@ -365,7 +391,7 @@ static bool loadAndValidateVFSOverlay(
     Diag.diagnose(SourceLoc(), diag::invalid_vfs_overlay_file, File);
     return true;
   }
-  OverlayFS->pushOverlay(VFS);
+  OverlayFS->pushOverlay(std::move(VFS));
   return false;
 }
 
@@ -588,17 +614,23 @@ bool CompilerInstance::setUpInputs() {
 
   const auto &Inputs =
       Invocation.getFrontendOptions().InputsAndOutputs.getAllInputs();
+  const bool shouldRecover = Invocation.getFrontendOptions()
+                                 .InputsAndOutputs.shouldRecoverMissingInputs();
+
+  bool hasFailed = false;
   for (const InputFile &input : Inputs) {
     bool failed = false;
-    Optional<unsigned> bufferID = getRecordedBufferID(input, failed);
-    if (failed)
-      return true;
+    Optional<unsigned> bufferID =
+        getRecordedBufferID(input, shouldRecover, failed);
+    hasFailed |= failed;
 
     if (!bufferID.hasValue() || !input.isPrimary())
       continue;
 
     recordPrimaryInputBuffer(*bufferID);
   }
+  if (hasFailed)
+    return true;
 
   // Set the primary file to the code-completion point if one exists.
   if (codeCompletionBufferID.hasValue() &&
@@ -610,8 +642,9 @@ bool CompilerInstance::setUpInputs() {
   return false;
 }
 
-Optional<unsigned> CompilerInstance::getRecordedBufferID(const InputFile &input,
-                                                         bool &failed) {
+Optional<unsigned>
+CompilerInstance::getRecordedBufferID(const InputFile &input,
+                                      const bool shouldRecover, bool &failed) {
   if (!input.getBuffer()) {
     if (Optional<unsigned> existingBufferID =
             SourceMgr.getIDForBufferIdentifier(input.getFileName())) {
@@ -619,6 +652,13 @@ Optional<unsigned> CompilerInstance::getRecordedBufferID(const InputFile &input,
     }
   }
   auto buffers = getInputBuffersIfPresent(input);
+
+  // Recover by dummy buffer if requested.
+  if (!buffers.hasValue() && shouldRecover &&
+      input.getType() == file_types::TY_Swift && !input.isPrimary()) {
+    buffers = ModuleBuffers(llvm::MemoryBuffer::getMemBuffer(
+        "// missing file\n", input.getFileName()));
+  }
 
   if (!buffers.hasValue()) {
     failed = true;
@@ -649,8 +689,13 @@ Optional<ModuleBuffers> CompilerInstance::getInputBuffersIfPresent(
   // FIXME: Working with filenames is fragile, maybe use the real path
   // or have some kind of FileManager.
   using FileOrError = llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>;
-  FileOrError inputFileOrErr = swift::vfs::getFileOrSTDIN(getFileSystem(),
-                                                          input.getFileName());
+  FileOrError inputFileOrErr =
+    swift::vfs::getFileOrSTDIN(getFileSystem(), input.getFileName(),
+                              /*FileSize*/-1,
+                              /*RequiresNullTerminator*/true,
+                              /*IsVolatile*/false,
+      /*Bad File Descriptor Retry*/getInvocation().getFrontendOptions()
+                               .BadFileDescriptorRetryCount);
   if (!inputFileOrErr) {
     Diagnostics.diagnose(SourceLoc(), diag::error_open_input_file,
                          input.getFileName(),
@@ -708,7 +753,10 @@ CompilerInstance::openModuleDoc(const InputFile &input) {
 }
 
 bool CompilerInvocation::shouldImportSwiftConcurrency() const {
-  return getLangOptions().EnableExperimentalConcurrency;
+  return getLangOptions().EnableExperimentalConcurrency
+      && !getLangOptions().DisableImplicitConcurrencyModuleImport &&
+      getFrontendOptions().InputMode !=
+        FrontendOptions::ParseInputMode::SwiftModuleInterface;
 }
 
 /// Implicitly import the SwiftOnoneSupport module in non-optimized
@@ -911,8 +959,30 @@ void CompilerInstance::setMainModule(ModuleDecl *newMod) {
 bool CompilerInstance::performParseAndResolveImportsOnly() {
   FrontendStatsTracer tracer(getStatsReporter(), "parse-and-resolve-imports");
 
-  // Resolve imports for all the source files.
   auto *mainModule = getMainModule();
+
+  // Load access notes.
+  if (!Invocation.getFrontendOptions().AccessNotesPath.empty()) {
+    auto accessNotesPath = Invocation.getFrontendOptions().AccessNotesPath;
+
+    auto bufferOrError =
+        swift::vfs::getFileOrSTDIN(getFileSystem(), accessNotesPath);
+    if (bufferOrError) {
+      int sourceID =
+          SourceMgr.addNewSourceBuffer(std::move(bufferOrError.get()));
+      auto buffer =
+          SourceMgr.getLLVMSourceMgr().getMemoryBuffer(sourceID);
+
+      if (auto accessNotesFile = AccessNotesFile::load(*Context, buffer))
+        mainModule->getAccessNotes() = *accessNotesFile;
+    }
+    else {
+      Diagnostics.diagnose(SourceLoc(), diag::access_notes_file_io_error,
+                           accessNotesPath, bufferOrError.getError().message());
+    }
+  }
+
+  // Resolve imports for all the source files.
   for (auto *file : mainModule->getFiles()) {
     if (auto *SF = dyn_cast<SourceFile>(file))
       performImportResolution(*SF);
@@ -1139,7 +1209,8 @@ static void countStatsPostSILOpt(UnifiedStatsReporter &Stats,
 }
 
 bool CompilerInstance::performSILProcessing(SILModule *silModule) {
-  if (performMandatorySILPasses(Invocation, silModule))
+  if (performMandatorySILPasses(Invocation, silModule) &&
+      !Invocation.getFrontendOptions().AllowModuleWithCompilerErrors)
     return true;
 
   {
@@ -1181,21 +1252,4 @@ const PrimarySpecificPaths &
 CompilerInstance::getPrimarySpecificPathsForSourceFile(
     const SourceFile &SF) const {
   return Invocation.getPrimarySpecificPathsForSourceFile(SF);
-}
-
-bool CompilerInstance::emitSwiftRanges(DiagnosticEngine &diags,
-                                       SourceFile *primaryFile,
-                                       StringRef outputPath) const {
-  return incremental_ranges::SwiftRangesEmitter(outputPath, primaryFile,
-                                                SourceMgr, diags)
-      .emit();
-  return false;
-}
-
-bool CompilerInstance::emitCompiledSource(DiagnosticEngine &diags,
-                                          const SourceFile *primaryFile,
-                                          StringRef outputPath) const {
-  return incremental_ranges::CompiledSourceEmitter(outputPath, primaryFile,
-                                                   SourceMgr, diags)
-      .emit();
 }

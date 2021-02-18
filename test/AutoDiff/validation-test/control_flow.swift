@@ -5,6 +5,9 @@
 // iphonesimulator-i386-specific failures.
 // REQUIRES: CPU=x86_64
 
+// rdar://71642726 this test is crashing with optimizations.
+// REQUIRES: swift_test_mode_optimize_none
+
 import _Differentiation
 import StdlibUnittest
 
@@ -380,7 +383,7 @@ ControlFlowTests.test("NestedConditionals") {
     struct TF_781: Differentiable {
       var w: Float = 3
 
-      @differentiable(wrt: self) // wrt only self is important
+      @differentiable(reverse, wrt: self) // wrt only self is important
       func callAsFunction(_ input: Float) -> Float {
         var x = input
         if true {
@@ -399,7 +402,7 @@ ControlFlowTests.test("NestedConditionals") {
 
   // Non-method version of TF-781.
   do {
-    @differentiable(wrt: x)
+    @differentiable(reverse, wrt: x)
     func TF_781(_ x: Float, _ y: Float) -> Float {
       var result = y
       if true {
@@ -532,7 +535,7 @@ ControlFlowTests.test("Enums") {
     var w1: Float
     @noDerivative var w2: Float?
 
-    @differentiable
+    @differentiable(reverse)
     func callAsFunction(_ input: Float) -> Float {
       if let w2 = w2 {
         return input * w1 * w2
@@ -713,6 +716,19 @@ ControlFlowTests.test("Loops") {
   expectEqual((20, 22), valueWithGradient(at: 2, in: { x in nested_loop2(x, count: 2) }))
   expectEqual((52, 80), valueWithGradient(at: 2, in: { x in nested_loop2(x, count: 3) }))
   expectEqual((24, 28), valueWithGradient(at: 2, in: { x in nested_loop2(x, count: 4) }))
+
+  // SR13945: Loops in methods caused a runtime segfault.
+  struct SR13945 {
+    func loopInMethod(_ x: Float) -> Float {
+      var result = x
+      for _ in 0..<2 {
+        result *= result
+      }
+      return result
+    }
+  }
+  expectEqual((0, 0), valueWithGradient(at: 0, in: { SR13945().loopInMethod($0) }))
+  expectEqual((1, 4), valueWithGradient(at: 1, in: { SR13945().loopInMethod($0) }))
 }
 
 ControlFlowTests.test("BranchingCastInstructions") {
@@ -740,14 +756,14 @@ ControlFlowTests.test("ThrowingCalls") {
    // TF-433: Test non-active `try_apply` differentiation.
   func throwing() throws -> Void {}
 
-  @differentiable
+  @differentiable(reverse)
   func testThrowing(_ x: Float) -> Float {
     try! throwing()
     return x
   }
   expectEqual(10, pullback(at: 3, in: testThrowing)(10))
 
-  @differentiable
+  @differentiable(reverse)
   func testThrowingGeneric<T: Differentiable>(_ x: T) -> T {
     try! throwing()
     return x
@@ -756,21 +772,21 @@ ControlFlowTests.test("ThrowingCalls") {
 
   func rethrowing(_ body: () throws -> Void) rethrows -> Void {}
 
-  @differentiable
+  @differentiable(reverse)
   func testRethrowingIdentity(_ x: Float) -> Float {
     rethrowing({}) // non-active `try_apply`
     return x
   }
   expectEqual(10, pullback(at: 3, in: testRethrowingIdentity)(10))
 
-  @differentiable
+  @differentiable(reverse)
   func testRethrowingIdentityGeneric<T: Differentiable>(_ x: T) -> T {
     rethrowing({}) // non-active `try_apply`
     return x
   }
   expectEqual(10, pullback(at: 3, in: testRethrowingIdentityGeneric)(10))
 
-  @differentiable
+  @differentiable(reverse)
   func testComplexControlFlow(_ x: Float) -> Float {
     rethrowing({})
     for _ in 0..<Int(x) {
@@ -784,7 +800,7 @@ ControlFlowTests.test("ThrowingCalls") {
   }
   expectEqual(10, pullback(at: 3, in: testComplexControlFlow)(10))
 
-  @differentiable
+  @differentiable(reverse)
   func testComplexControlFlowGeneric<T: Differentiable>(_ x: T) -> T {
     rethrowing({})
     for _ in 0..<10 {

@@ -334,9 +334,10 @@ protected:
     NumCaptures : 32
   );
 
-  SWIFT_INLINE_BITFIELD(ApplyExpr, Expr, 1+1,
+  SWIFT_INLINE_BITFIELD(ApplyExpr, Expr, 1+1+1,
     ThrowsIsSet : 1,
-    Throws : 1
+    Throws : 1,
+    ImplicitlyAsync : 1
   );
 
   SWIFT_INLINE_BITFIELD_FULL(CallExpr, ApplyExpr, 1+1+16,
@@ -3121,24 +3122,9 @@ public:
   static bool classof(const Expr *E) { return E->getKind() == ExprKind::Load; }
 };
 
-/// This is a conversion from an expression of UnresolvedType to an arbitrary
-/// other type, and from an arbitrary type to UnresolvedType.  This node does
-/// not appear in valid code, only in code involving diagnostics.
-class UnresolvedTypeConversionExpr : public ImplicitConversionExpr {
-public:
-  UnresolvedTypeConversionExpr(Expr *subExpr, Type type)
-  : ImplicitConversionExpr(ExprKind::UnresolvedTypeConversion, subExpr, type) {}
-
-  static bool classof(const Expr *E) {
-    return E->getKind() == ExprKind::UnresolvedTypeConversion;
-  }
-};
-
 /// FunctionConversionExpr - Convert a function to another function type,
 /// which might involve renaming the parameters or handling substitutions
 /// of subtypes (in the return) or supertypes (in the input).
-///
-/// FIXME: This should be a CapturingExpr.
 class FunctionConversionExpr : public ImplicitConversionExpr {
 public:
   FunctionConversionExpr(Expr *subExpr, Type type)
@@ -3553,6 +3539,79 @@ public:
   }
 };
 
+/// Actor isolation for a closure.
+class ClosureActorIsolation {
+public:
+  enum Kind {
+    /// The closure is independent of any actor.
+    Independent,
+
+    /// The closure is tied to the actor instance described by the given
+    /// \c VarDecl*, which is the (captured) `self` of an actor.
+    ActorInstance,
+
+    /// The closure is tied to the global actor described by the given type.
+    GlobalActor,
+  };
+
+private:
+    /// The actor to which this closure is isolated.
+    ///
+    /// There are three possible states:
+    ///   - NULL: The closure is independent of any actor.
+    ///   - VarDecl*: The 'self' variable for the actor instance to which
+    ///     this closure is isolated. It will always have a type that conforms
+    ///     to the \c Actor protocol.
+    ///   - Type: The type of the global actor on which
+  llvm::PointerUnion<VarDecl *, Type> storage;
+
+  ClosureActorIsolation(VarDecl *selfDecl) : storage(selfDecl) { }
+  ClosureActorIsolation(Type globalActorType) : storage(globalActorType) { }
+
+public:
+  ClosureActorIsolation() : storage() { }
+
+  static ClosureActorIsolation forIndependent() {
+    return ClosureActorIsolation();
+  }
+
+  static ClosureActorIsolation forActorInstance(VarDecl *selfDecl) {
+    return ClosureActorIsolation(selfDecl);
+  }
+
+  static ClosureActorIsolation forGlobalActor(Type globalActorType) {
+    return ClosureActorIsolation(globalActorType);
+  }
+
+  /// Determine the kind of isolation.
+  Kind getKind() const {
+    if (storage.isNull())
+      return Kind::Independent;
+
+    if (storage.is<VarDecl *>())
+      return Kind::ActorInstance;
+
+    return Kind::GlobalActor;
+  }
+
+  /// Whether the closure is isolated at all.
+  explicit operator bool() const {
+    return getKind() != Kind::Independent;
+  }
+
+  /// Whether the closure is isolated at all.
+  operator Kind() const {
+    return getKind();
+  }
+
+  VarDecl *getActorInstance() const {
+    return storage.dyn_cast<VarDecl *>();
+  }
+
+  Type getGlobalActor() const {
+    return storage.dyn_cast<Type>();
+  }
+};
 
 /// A base class for closure expressions.
 class AbstractClosureExpr : public DeclContext, public Expr {
@@ -3560,6 +3619,9 @@ class AbstractClosureExpr : public DeclContext, public Expr {
 
   /// The set of parameters.
   ParameterList *parameterList;
+
+  /// Actor isolation of the closure.
+  ClosureActorIsolation actorIsolation;
 
 public:
   AbstractClosureExpr(ExprKind Kind, Type FnType, bool Implicit,
@@ -3624,6 +3686,12 @@ public:
   ///
   /// Only valid when \c hasSingleExpressionBody() is true.
   Expr *getSingleExpressionBody() const;
+
+  ClosureActorIsolation getActorIsolation() const { return actorIsolation; }
+
+  void setActorIsolation(ClosureActorIsolation actorIsolation) {
+    this->actorIsolation = actorIsolation;
+  }
 
   static bool classof(const Expr *E) {
     return E->getKind() >= ExprKind::First_AbstractClosureExpr &&
@@ -4226,6 +4294,7 @@ protected:
     assert(classof((Expr*)this) && "ApplyExpr::classof out of date");
     assert(validateArg(Arg) && "Arg is not a permitted expr kind");
     Bits.ApplyExpr.ThrowsIsSet = false;
+    Bits.ApplyExpr.ImplicitlyAsync = false;
   }
 
 public:
@@ -4262,6 +4331,29 @@ public:
     assert(!Bits.ApplyExpr.ThrowsIsSet);
     Bits.ApplyExpr.ThrowsIsSet = true;
     Bits.ApplyExpr.Throws = throws;
+  }
+
+  /// Is this application _implicitly_ required to be an async call?
+  /// Note that this is _not_ a check for whether the callee is async!
+  /// Only meaningful after complete type-checking.
+  ///
+  /// Generally, this comes up only when we have a non-self call to an actor
+  /// instance's synchronous method. Such calls are conceptually treated as if
+  /// they are wrapped with an async closure. For example,
+  ///
+  ///   act.syncMethod(a, b) 
+  ///
+  /// is equivalent to the eta-expanded version of act.syncMethod,
+  ///
+  ///   { (a1, b1) async in act.syncMethod(a1, b1) }(a, b)
+  ///
+  /// where the new closure is declared to be async.
+  ///
+  bool implicitlyAsync() const {
+    return Bits.ApplyExpr.ImplicitlyAsync;
+  }
+  void setImplicitlyAsync(bool flag) {
+    Bits.ApplyExpr.ImplicitlyAsync = flag;
   }
 
   ValueDecl *getCalledValue() const;

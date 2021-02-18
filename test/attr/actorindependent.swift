@@ -2,7 +2,6 @@
 
 // REQUIRES: concurrency
 
-// expected-error@+1{{'@actorIndependent' can only be applied to actor members and global/static variables}}
 @actorIndependent func globalFunction() { }
 
 @actorIndependent var globalComputedProperty1: Int { 17 }
@@ -33,12 +32,14 @@ struct X {
 }
 
 class C {
-  // expected-error@+1{{'@actorIndependent' can only be applied to actor members and global/static variables}}
   @actorIndependent
   var property3: Int { 5 }
+
+  @actorIndependent
+  func f() { }
 }
 
-actor class A {
+actor A {
   var property: Int = 5
 
   // expected-error@+1{{'@actorIndependent' can not be applied to stored properties}}
@@ -65,6 +66,8 @@ actor class A {
     set { }
   }
 
+  @actorIndependent init() { }
+
   @actorIndependent
   func synchronousFunc() { }
 
@@ -74,11 +77,10 @@ actor class A {
   @actorIndependent
   subscript(index: Int) -> String { "\(index)" }
 
-  // expected-error@+1{{'@actorIndependent' can only be applied to instance members of actors}}
   @actorIndependent static func staticFunc() { }
 }
 
-actor class FromProperty {
+actor FromProperty {
   // expected-note@+3{{mutable state is only available within the actor instance}}
   // expected-note@+2{{mutable state is only available within the actor instance}}
   // expected-note@+1{{mutable state is only available within the actor instance}}
@@ -96,3 +98,5 @@ actor class FromProperty {
     set { counter = newValue }
   }
 }
+
+@actorIndependent extension FromProperty { }

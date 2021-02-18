@@ -36,17 +36,9 @@ bb0:
   return %result : $()
 }
 
-sil @main : $@async @convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
-bb0(%argc : $Int32, %argv : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
-  %createAndInvokeClosure = function_ref @createAndInvokeClosure : $@async @convention(thin) () -> ()
-  %createAndInvokeClosure_result = apply %createAndInvokeClosure() : $@async @convention(thin) () -> ()
-  %out_literal = integer_literal $Builtin.Int32, 0
-  %out = struct $Int32 (%out_literal : $Builtin.Int32)
-  return %out : $Int32
-}
-
-// CHECK-LL: define internal swiftcc void @closure(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* {{%[0-9]+}}) {{#[0-9]*}}
-// CHECK-LL: define internal swiftcc void @"$s7closureTA"(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* {{%[0-9]+}}, %swift.refcounted* swiftself {{%[0-9]*}}) {{#[0-9]*}}
+// CHECK-LL: @closureTu =
+// CHECK-LL: define internal swiftcc void @closure(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* swiftasync {{%[0-9]+}}) {{#[0-9]*}}
+// CHECK-LL: define internal swiftcc void @"$s7closureTA"(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* swiftasync {{%[0-9]+}}) {{#[0-9]*}}
 sil hidden @createPartialApply : $@async @convention(thin) (Int64) -> @owned @async @callee_guaranteed (Int64) -> Int64 {
 bb0(%captured : $Int64):
   %closure = function_ref @closure : $@async @convention(thin) (Int64, Int64) -> Int64
@@ -70,3 +62,26 @@ bb0(%one : $Int64, %two : $Int64):
   return %sum : $Int64
 }
 
+sil @test_case : $@convention(thin) @async () -> () {
+  %createAndInvokeClosure = function_ref @createAndInvokeClosure : $@async @convention(thin) () -> ()
+  %createAndInvokeClosure_result = apply %createAndInvokeClosure() : $@async @convention(thin) () -> ()
+
+  %void = tuple()
+  return %void : $()
+}
+
+// Defined in _Concurrency
+sil @$s12_Concurrency13_runAsyncMainyyyyYKcF : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
+
+// main
+sil @main : $@convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
+bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
+  %test_case_nothrow = function_ref @test_case : $@convention(thin) @async () -> ()
+  %test_case = convert_function %test_case_nothrow : $@convention(thin) @async () -> () to $@convention(thin) @async () -> @error Error
+  %thick_test_case = thin_to_thick_function %test_case : $@convention(thin) @async () -> @error Error to $@callee_guaranteed @async () -> @error Error
+  %runAsyncMain = function_ref @$s12_Concurrency13_runAsyncMainyyyyYKcF : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
+  %result = apply %runAsyncMain(%thick_test_case) : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
+  %out_literal = integer_literal $Builtin.Int32, 0
+  %out = struct $Int32 (%out_literal : $Builtin.Int32)
+  return %out : $Int32
+}

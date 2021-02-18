@@ -532,12 +532,17 @@ void AccessScope::dump() const {
 
   if (auto *decl = getDeclContext()->getAsDecl()) {
     llvm::errs() << Decl::getKindName(decl->getKind()) << " ";
-    if (auto *ext = dyn_cast<ExtensionDecl>(decl))
-      llvm::errs() << ext->getExtendedNominal()->getName();
-    else if (auto *named = dyn_cast<ValueDecl>(decl))
+    if (auto *ext = dyn_cast<ExtensionDecl>(decl)) {
+      auto *extended = ext->getExtendedNominal();
+      if (extended)
+        llvm::errs() << extended->getName();
+      else
+        llvm::errs() << "(null)";
+    } else if (auto *named = dyn_cast<ValueDecl>(decl)) {
       llvm::errs() << named->getName();
-    else
+    } else {
       llvm::errs() << (const void *)decl;
+    }
 
     SourceLoc loc = decl->getLoc();
     if (loc.isValid()) {
@@ -753,11 +758,19 @@ ArrayRef<Decl *> IterableDeclContext::getParsedMembers() const {
     .members;
 }
 
-ArrayRef<Decl *> IterableDeclContext::getSemanticMembers() const {
+ArrayRef<Decl *> IterableDeclContext::getABIMembers() const {
   ASTContext &ctx = getASTContext();
   return evaluateOrDefault(
       ctx.evaluator,
-      SemanticMembersRequest{const_cast<IterableDeclContext *>(this)},
+      ABIMembersRequest{const_cast<IterableDeclContext *>(this)},
+      ArrayRef<Decl *>());
+}
+
+ArrayRef<Decl *> IterableDeclContext::getAllMembers() const {
+  ASTContext &ctx = getASTContext();
+  return evaluateOrDefault(
+      ctx.evaluator,
+      AllMembersRequest{const_cast<IterableDeclContext *>(this)},
       ArrayRef<Decl *>());
 }
 
@@ -1011,25 +1024,12 @@ IterableDeclContext::castDeclToIterableDeclContext(const Decl *D) {
   }
 }
 
-Optional<std::string> IterableDeclContext::getBodyFingerprint() const {
-  // Only makes sense for contexts in a source file
-  if (!getAsGenericContext()->getParentSourceFile())
-    return None;
+Optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
   auto mutableThis = const_cast<IterableDeclContext *>(this);
   return evaluateOrDefault(getASTContext().evaluator,
                            ParseMembersRequest{mutableThis},
                            FingerprintAndMembers())
       .fingerprint;
-}
-
-bool IterableDeclContext::areTokensHashedForThisBodyInsteadOfInterfaceHash()
-    const {
-  // Do not keep separate hashes for extension bodies because the dependencies
-  // can miss the addition of a member in an extension because there is nothing
-  // corresponding to the fingerprinted nominal dependency node.
-  if (isa<ExtensionDecl>(this))
-    return false;
-  return true;
 }
 
 /// Return the DeclContext to compare when checking private access in
@@ -1058,16 +1058,14 @@ getPrivateDeclContext(const DeclContext *DC, const SourceFile *useSF) {
   return lastExtension ? lastExtension : DC;
 }
 
-AccessScope::AccessScope(const DeclContext *DC, bool isPrivate, bool isSPI)
-    : Value(DC, isPrivate || isSPI) {
+AccessScope::AccessScope(const DeclContext *DC, bool isPrivate)
+    : Value(DC, isPrivate) {
   if (isPrivate) {
     DC = getPrivateDeclContext(DC, DC->getParentSourceFile());
     Value.setPointer(DC);
   }
   if (!DC || isa<ModuleDecl>(DC))
     assert(!isPrivate && "public or internal scope can't be private");
-  if (DC)
-    assert(!isSPI && "only public scopes can be SPI");
 }
 
 bool AccessScope::isFileScope() const {

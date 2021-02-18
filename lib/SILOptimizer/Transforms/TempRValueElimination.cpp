@@ -17,7 +17,9 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-temp-rvalue-opt"
+
 #include "swift/SIL/DebugUtils.h"
+#include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
@@ -506,6 +508,8 @@ bool TempRValueOptPass::tryOptimizeCopyIntoTemp(CopyAddrInst *copyInst) {
   while (!tempObj->use_empty()) {
     Operand *use = *tempObj->use_begin();
     SILInstruction *user = use->getUser();
+    aa->invalidateInstruction(user);
+
     switch (user->getKind()) {
     case SILInstructionKind::DestroyAddrInst:
     case SILInstructionKind::DeallocStackInst:
@@ -734,6 +738,20 @@ void TempRValueOptPass::run() {
   // Delete the copies and any unused address operands.
   // The same copy may have been added multiple times.
   sortUnique(deadCopies);
+  InstModCallbacks callbacks{
+#ifndef NDEBUG
+      // With asserts, we include this assert. Otherwise, we use the default
+      // impl for perf.
+      [](SILInstruction *instToKill) {
+        // SimplifyInstruction is not in the business of removing
+        // copy_addr. If it were, then we would need to update deadCopies.
+        assert(!isa<CopyAddrInst>(instToKill));
+        instToKill->eraseFromParent();
+      }
+#endif
+  };
+
+  DeadEndBlocks deBlocks(getFunction());
   for (auto *deadCopy : deadCopies) {
     assert(changed);
     auto *srcInst = deadCopy->getSrc()->getDefiningInstruction();
@@ -741,15 +759,7 @@ void TempRValueOptPass::run() {
     // Simplify any access scope markers that were only used by the dead
     // copy_addr and other potentially unused addresses.
     if (srcInst) {
-      if (SILValue result = simplifyInstruction(srcInst)) {
-        replaceAllSimplifiedUsesAndErase(
-            srcInst, result, [](SILInstruction *instToKill) {
-              // SimplifyInstruction is not in the business of removing
-              // copy_addr. If it were, then we would need to update deadCopies.
-              assert(!isa<CopyAddrInst>(instToKill));
-              instToKill->eraseFromParent();
-            });
-      }
+      simplifyAndReplaceAllSimplifiedUsesAndErase(srcInst, callbacks, &deBlocks);
     }
   }
   if (changed) {

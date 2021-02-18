@@ -52,7 +52,7 @@ public:
                          NestedAccessType::StopAtAccessBegin),
         writeAccumulator(writes) {}
 
-  bool visitUse(Operand *op, AccessUseType useTy);
+  bool visitUse(Operand *op, AccessUseType useTy) override;
 };
 
 // Functor for MultiMapCache construction.
@@ -97,6 +97,7 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::DeallocBoxInst:
   case SILInstructionKind::WitnessMethodInst:
   case SILInstructionKind::ExistentialMetatypeInst:
+  case SILInstructionKind::IsUniqueInst:
     return true;
 
   // Known writes...
@@ -107,6 +108,8 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::AssignInst:
   case SILInstructionKind::UncheckedTakeEnumDataAddrInst:
   case SILInstructionKind::MarkFunctionEscapeInst:
+  case SILInstructionKind::DeallocRefInst:
+  case SILInstructionKind::DeallocPartialRefInst:
     writeAccumulator.push_back(op);
     return true;
 
@@ -243,6 +246,18 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
     return false;
   }
 
+  if (auto *pa = dyn_cast<PartialApplyInst>(user)) {
+    auto argConv = ApplySite(user).getArgumentConvention(*op);
+    if (pa->isOnStack() &&
+        argConv == SILArgumentConvention::Indirect_In_Guaranteed) {
+      return true;
+    }
+
+    // For all other conventions, the underlying address could be mutated
+    writeAccumulator.push_back(op);
+    return true;
+  }
+
   // Handle a capture-by-address like a write.
   if (auto as = ApplySite::isa(user)) {
     writeAccumulator.push_back(op);
@@ -256,12 +271,11 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   if (!op->get()->getType().isAddress() && !user->mayWriteToMemory()) {
     return true;
   }
-  // If we did not recognize the user, just return conservatively that it was
-  // written to in a way we did not understand.
+  // If we did not recognize the user, print additional error diagnostics and
+  // return false to force SIL verification to fail.
   llvm::errs() << "Function: " << user->getFunction()->getName() << "\n";
   llvm::errs() << "Value: " << op->get();
   llvm::errs() << "Unknown instruction: " << *user;
-  llvm::report_fatal_error("Unexpected instruction using borrowed address?!");
   return false;
 }
 
@@ -278,8 +292,7 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
     LoadBorrowInst *lbi, ArrayRef<Operand *> endBorrowUses,
     AccessPath accessPath) {
 
-  SmallPtrSet<SILBasicBlock *, 8> visitedBlocks;
-  LinearLifetimeChecker checker(visitedBlocks, deadEndBlocks);
+  LinearLifetimeChecker checker(deadEndBlocks);
   auto writes = cache.get(accessPath);
 
   // Treat None as a write.
@@ -290,8 +303,6 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
   }
   // Then for each write...
   for (auto *op : *writes) {
-    visitedBlocks.clear();
-
     // First see if the write is a dead end block. In such a case, just skip it.
     if (deadEndBlocks.isDeadEnd(op->getUser()->getParent())) {
       continue;

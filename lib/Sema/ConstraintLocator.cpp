@@ -18,6 +18,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/Types.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/Sema/ConstraintLocator.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/StringExtras.h"
@@ -66,6 +67,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::KeyPathComponent:
   case ConstraintLocator::ConditionalRequirement:
   case ConstraintLocator::TypeParameterRequirement:
+  case ConstraintLocator::ConformanceRequirement:
   case ConstraintLocator::ImplicitlyUnwrappedDisjunctionChoice:
   case ConstraintLocator::DynamicLookupResult:
   case ConstraintLocator::ContextualType:
@@ -397,6 +399,15 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
       break;
     }
 
+    case ConformanceRequirement: {
+      auto *conformance =
+          elt.castTo<LocatorPathElt::ConformanceRequirement>().getConformance();
+      out << "conformance requirement (";
+      conformance->getProtocol()->dumpRef(out);
+      out << ")";
+      break;
+    }
+
     case ImplicitlyUnwrappedDisjunctionChoice:
       out << "implicitly unwrapped disjunction choice";
       break;
@@ -470,6 +481,10 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
 
       case AttrLoc::Attribute::Escaping:
         out << "@escaping";
+        break;
+
+      case AttrLoc::Attribute::Concurrent:
+        out << "@concurrent";
         break;
       }
 

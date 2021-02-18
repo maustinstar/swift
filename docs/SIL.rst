@@ -1590,11 +1590,14 @@ Differentiability Witnesses
   sil-differentiability-witness ::=
       'sil_differentiability_witness'
       sil-linkage?
+      '[' differentiability-kind ']'
       '[' 'parameters' sil-differentiability-witness-function-index-list ']'
       '[' 'results' sil-differentiability-witness-function-index-list ']'
       generic-parameter-clause?
       sil-function-name ':' sil-type
       sil-differentiability-witness-body?
+
+  differentiability-kind ::= 'forward' | 'reverse' | 'normal' | 'linear'
 
   sil-differentiability-witness-body ::=
       '{' sil-differentiability-witness-entry?
@@ -1625,7 +1628,7 @@ based on the key.
 
 ::
 
-  sil_differentiability_witness hidden [parameters 0] [results 0] <T where T : Differentiable> @id : $@convention(thin) (T) -> T {
+  sil_differentiability_witness hidden [normal] [parameters 0] [results 0] <T where T : Differentiable> @id : $@convention(thin) (T) -> T {
     jvp: @id_jvp : $@convention(thin) (T) -> (T, @owned @callee_guaranteed (T.TangentVector) -> T.TangentVector)
     vjp: @id_vjp : $@convention(thin) (T) -> (T, @owned @callee_guaranteed (T.TangentVector) -> T.TangentVector)
   }
@@ -1675,17 +1678,18 @@ Ownership SSA
 A SILFunction marked with the ``[ossa]`` function attribute is considered to be
 in Ownership SSA form. Ownership SSA is an augmented version of SSA that
 enforces ownership invariants by imbuing value-operand edges with semantic
-ownership information. All SIL values are statically assigned an ownership kind
+ownership information. All SIL values are assigned a constant ownership kind
 that defines the ownership semantics that the value models. All SIL operands
 that use a SIL value are required to be able to be semantically partitioned in
-between "normal uses" that just require the value to be live and "consuming
-uses" that end the lifetime of the value and after which the value can no longer
-be used. Since operands that are consuming uses end a value's lifetime,
-naturally we must have that the consuming use points jointly post-dominate all
-non-consuming use points and that a value must be consumed exactly once along
-all reachable program paths, preventing leaks and use-after-frees. As an
-example, consider the following SIL example with partitioned defs/uses annotated
-inline::
+between "non-lifetime ending uses" that just require the value to be live and
+"lifetime ending uses" that end the lifetime of the value and after which the
+value can no longer be used. Since by definition operands that are lifetime
+ending uses end their associated value's lifetime, we must have that, ignoring
+program ending `Dead End Blocks`_, the lifetime ending use points jointly
+post-dominate all non-lifetime ending use points and that a value must have
+exactly one lifetime ending use along all reachable program paths, preventing
+leaks and use-after-frees. As an example, consider the following SIL example
+with partitioned defs/uses annotated inline::
 
   sil @stash_and_cast : $@convention(thin) (@owned Klass) -> @owned SuperKlass {
   bb0(%kls1 : @owned $Klass): // Definition of %kls1
@@ -1710,12 +1714,101 @@ inline::
 
 Notice how every value in the SIL above has a partionable set of uses with
 normal uses always before consuming uses. Any such violations of ownership
-semantics would trigger a static SILVerifier error allowing us to know that we
+semantics would trigger a SILVerifier error allowing us to know that we
 do not have any leaks or use-after-frees in the above code.
 
+Ownership Kind
+~~~~~~~~~~~~~~
+
 The semantics in the previous example is of just one form of ownership semantics
-supported: "owned" semantics. In SIL, we allow for values to have one of four
-different ownership kinds:
+supported: "owned" semantics. In SIL, we map these "ownership semantics" into a
+form that a compiler can reason about by mapping semantics onto a lattice with
+the following elements: `None`_, `Owned`_, `Guaranteed`_, `Unowned`_, `Any`. We
+call this the lattice of "Ownership Kinds" and each individual value an
+"Ownership Kind". This lattice is defined as a 3-level lattice with::
+
+  1. None being Top.
+  2. Any being Bottom.
+  3. All non-Any, non-None OwnershipKinds being defined as a mid-level elements of the lattice
+
+We can graphically represent the lattice via a diagram like the following::
+
+                +------+
+      +-------- | None | ---------+
+      |         +------+          |
+      |            |              |
+      v            v              v         ^
+  +-------+  +-----+------+  +---------+    |
+  | Owned |  | Guaranteed |  | Unowned |    +--- Value Ownership Kinds and
+  +-------+  +-----+------+  +---------+         Ownership Constraints
+      |            |              |
+      |            v              |         +--- Only Ownership Constraints
+      |         +-----+           |         |
+      +-------->| Any |<----------+         v
+                +-----+
+
+One moves down the lattice by performing a "meet" operation::
+
+  None meet OtherOwnershipKind -> OtherOwnershipKind
+  Unowned meet Owned -> Any
+  Owned meet Guaranteed -> Any
+
+and one moves up the lattice by performing a "join" operation, e.x.::
+
+  Any join OtherOwnershipKind -> OtherOwnershipKind
+  Owned join Any -> Owned
+  Owned join Guaranteed -> None
+
+This lattice is applied to SIL by requiring well formed SIL to:
+
+1. Define a map of each SIL value to a constant OwnershipKind that classify the
+   semantics that the SIL value obeys. This ownership kind may be static (i.e.:
+   the same for all instances of an instruction) or dynamic (e.x.: forwarding
+   instructions set their ownership upon construction). We call this subset of
+   OwnershipKind to be the set of `Value Ownership Kind`_: `None`_, `Unowned`_,
+   `Guaranteed`_, `Owned`_ (note conspiciously missing `Any`). This is because
+   in our model `Any` represents an unknown ownership semantics and since our
+   model is strict, we do not allow for values to have unknown ownership.
+
+2. Define a map from each operand of a SILInstruction, `i`, to a constant
+   Ownership Kind, Boolean pair called the operand's `Ownership
+   Constraint`_. The Ownership Kind element of the `Ownership Constraint`_
+   determines semantically which ownership kind's the operand's value can take
+   on. The Boolean value is used to know if an operand will end the lifetime of
+   the incoming value when checking dataflow rules. The dataflow rules that each
+   `Value Ownership Kind`_ obeys is documented for each `Value Ownership Kind`_
+   in its detailed description below.
+
+Then we take these two maps and require that valid SIL has the property that
+given an operand, ``op(i)`` of an instruction ``i`` and a value ``v`` that
+``op(i)`` can only use ``v`` if the ``join`` of
+``OwnershipConstraint(operand(i))`` with ``ValueOwnershipKind(v)`` is equal to
+the ``ValueOwnershipKind`` of ``v``. In symbols, we must have that::
+
+  join : (OwnershipConstraint, ValueOwnershipKind) -> ValueOwnershipKind
+  OwnershipConstraint(operand(i)) join ValueOwnershipKind(v) = ValueOwnershipKind(v)
+
+In words, a value can be passed to an operand if applying the operand's
+ownership constraint to the value's ownership does not change the value's
+ownership. Operationally this has a few interesting effects on SIL:
+
+1. We have defined away invalid value-operand (aka def-use) pairing since the
+   SILVerifier validates the aforementioned relationship on all SIL values,
+   uses at all points of the pipeline until ossa is lowered.
+
+2. Many SIL instructions do not care about the ownership kind that their value
+   will take. They can just define all of their operand's as having an
+   ownership constraint of Any.
+
+Now lets go into more depth upon `Value Ownership Kind`_ and `Ownership Constraint`_.
+
+Value Ownership Kind
+~~~~~~~~~~~~~~~~~~~~
+
+As mentioned above, each SIL value is statically mapped to an `Ownership Kind`_
+called the value's "ValueOwnershipKind" that classify the semantics of the
+value. Below, we map each ValueOwnershipKind to a short summary of the semantics
+implied upon the parent value:
 
 * **None**. This is used to represent values that do not require memory
   management and are outside of Ownership SSA invariants. Examples: trivial
@@ -1739,10 +1832,7 @@ different ownership kinds:
   bitcasting a trivial type to a non-trivial type. This value should never be
   consumed.
 
-We describe each of these semantics in more detail below.
-
-Value Ownership Kind
-~~~~~~~~~~~~~~~~~~~~
+We describe each of these semantics in below in more detail.
 
 Owned
 `````
@@ -1912,10 +2002,26 @@ This is a form of ownership that is used to model two different use cases:
   trivial pointer to a class. In that case, since we have no reason to assume
   that the object will remain alive, we need to make a copy of the value.
 
+Ownership Constraint
+~~~~~~~~~~~~~~~~~~~~
+
+NOTE: We assume that one has read the section above on `Ownership Kind`_.
+
+As mentioned above, every operand ``operand(i)`` of a SIL instruction ``i`` has
+statically mapped to it:
+
+1. An ownership kind that acts as an "Ownership Constraint" upon what "Ownership
+   Kind" a value can take.
+
+2. A boolean value that defines whether or not the execution of the operand's
+   instruction will cause the operand's value to be invalidated. This is often
+   times referred to as an operand acting as a "lifetime ending use".
+
 Forwarding Uses
 ~~~~~~~~~~~~~~~
 
-NOTE: In the following, we assumed that one read the section above, `Value Ownership Kind`_.
+NOTE: In the following, we assumed that one read the section above, `Ownership
+Kind`_, `Value Ownership Kind`_ and `Ownership Constraint`_.
 
 A subset of SIL instructions define the value ownership kind of their results in
 terms of the value ownership kind of their operands. Such an instruction is
@@ -2042,6 +2148,252 @@ parts::
        // Then return %1 to our caller
        return %1 : $Klass
      }
+
+Borrowed Object based Safe Interior Pointers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+What is an "Unsafe Interior Pointer"
+````````````````````````````````````
+
+An unsafe interior pointer is a bare pointer into the innards of an object. A
+simple example of this in C++ would be using the method std::vector::data() to
+get to the innards of a std::vector. In general interior pointers are unsafe to
+use since languages do not provide any guarantees that the interior pointer will
+not be used after the underlying object has been deallocated. To see this,
+consider the following C++ example::
+
+    int unfortunateFunction() {
+      int *unsafeInteriorPointer = nullptr;
+      {
+        std::vector<int> vector;
+        vector.push_back(5);
+        unsafeInteriorPointer = vector.data();
+        printf("%d\n", *unsafeInteriorPointer); // Prints "5".
+      } // vector deallocated here
+      return *unsafeInteriorPointer; // Kaboom
+    }
+
+In words, C++ allows for us to get the interior pointer into the vector, but
+then lets us do whatever we want with the pointer, including use it after the
+underlying memory has been invalidated.
+
+From a user's perspective, interior pointers are really useful since one can use
+it to pass data to other APIs that are only expecting a pointer and also since
+one can use it to sometimes get better performance. But from a language designer
+perspective, this sort of API verboten and leads to bugs, crashes, and security
+vulnerabilities. That being said, clearly users have a need for such
+functionality, so we, as language designers, should figure out manners to
+express these sorts of patterns in our various languages in a safe way that
+prevents user’s from foot-gunning themselves. In SIL, we have solved this
+problem via the direct modeling of interior pointer instructions as a high level
+concept in our IR.
+
+Safe Interior Pointers in SIL
+`````````````````````````````
+
+In contrast to LLVM-IR, SIL provides mechanisms that language designers can use
+to express concepts like the above in a manner that allows the language to
+define away compiler generated unsafe interior pointer usage using "Safe
+Interior Pointers". This is implemented in SIL by:
+
+1. Classifying a set of instructions as being "interior pointer" instructions.
+2. Enforcing in the SILVerifier that all "interior pointer" instructions can
+   only have operands with `Guaranteed`_ ownership.
+3. Enforcing in the SILVerifier that any transitive address use of the interior
+   pointer to be a liveness requirement of the "interior pointer"'s
+   operand.
+
+Note that the transitive address use verifier from (3) does not attempt to
+classify uses directly. Instead the verifier:
+
+1. Has an explicit list of instructions that it understands as requiring
+   liveness of the base object.
+
+2. Has a second list of instructions that require liveness and produce a address
+   whose transitive uses need to be recursively processed.
+
+3. Asserts on any instructions that are not known to the verifier. This ensures
+   that the verifier is kept up to date with new instructions.
+
+Note that typically instructions in category (1) are instructions whose uses do
+not propagate the pointer value, so they are safe. In contrast, some other
+instructions in category (1) are escaping uses of the address such as
+`pointer_to_address`_. Those uses are unsafe--the user is reponsible for
+managing unsafe pointer lifetimes and the compiler must not extend those pointer
+lifetimes.
+
+These rules ensure statically that any uses of the address that are not escaped
+explicitly by an instruction like `pointer_to_address`_ are within the
+guaranteed pointers scope where the guaranteed value is statically known to be
+live. As a result, in SIL it is impossible to express such a bug in compiler
+generated code. As an example, consider the following unsafe interior pointer
+SIL::
+
+    class Klass { var k: KlassField }
+    struct KlassWrapper { var k: Klass }
+
+    // ...
+
+    // Today SIL restricts interior pointer instructions to only have operands
+    // with guaranteed ownership.
+    %1 = begin_borrow %0 : $Klass
+
+    // %2 is an interior pointer into %1. Since %2 is an address, it's uses are
+    // not treated as uses of underlying borrowed object %1 in the ownership
+    // system. This is because at the ownership level objects with None
+    // ownership are not verified and do not have any constraints on how they
+    // are used from the ownership system.
+    //
+    // Instead the ownership verifier gathers up all such uses and treats them
+    // as uses of the object from which the interior pointer was projected from
+    // transitively. This means that this is a constraint on the guaranteed
+    // objects use, not on the trivial values.
+    %2 = ref_element_addr %1 : $Klass, #Klass.k // %2 is a $*KlassWrapper
+    %3 = struct_element_addr %2 : $*KlassWrapper, #KlassWrapper.k // %3 is a $*Klass
+
+    // So if we end the borrow %1 at this point, invalidating the addresses
+    // ``%2`` and ``%3``.
+    end_borrow %1 : $Klass
+
+    // We would here be loading from an invalidated address. This would cause a
+    // verifier error since %3's use here is a regular use that is inferred up
+    // on %1.
+    %4 = load [copy] %3 : $*KlassWrapper
+
+    // ...
+
+Notice how due to a possible bug in the compiler, we are loading from
+potentially uninitialized memory ``%4``. This would have caused a verifier error
+stating that ``%4`` was an interior pointer based use-after-free of ``%1``
+implying this is mal-formed SIL.
+
+NOTE: This is a constraint on the base object, not on the addresses themselves
+which are viewed as outside of the ownership system since they have `None`_
+ownership.
+
+In contrast to the previous example, the following example follows ownership
+invariants and is valid SIL::
+
+    class Klass { var k: KlassField }
+    struct KlassWrapper { var k: Klass }
+
+    // ...
+
+    %1 = begin_borrow %0 : $Klass
+    // %2 is an interior pointer into the Klass k. Since %2 is an address and
+    // addresses have None ownership, it's uses are not treated as uses of the
+    // underlying object %1.
+    %2 = ref_element_addr %1 : $Klass, #Klass.k // %2 is a $*KlassWrapper
+
+    // Destroying %1 at this location would result in a verifier error since
+    // %2's uses are considered to be uses of %1.
+    //
+    // end_lifetime %1 : $Klass
+
+    // We are statically not loading from an invalidated address here since we
+    // are within the lifetime of ``%1``.
+    %3 = struct_element_addr %2 : $*KlassWrapper, #KlassWrapper.k
+    %4 = load [copy] %3 : $*Klass // %1 must be live here transitively
+
+    // ``%1``'s lifetime ends. Importantly we know that within the lifetime of
+    // ``%1``, ``%0``'s lifetime can not shrink past this point, implying
+    // transitive static safety.
+    end_borrow %1 : $Klass
+
+In the second example, we show a well-formed SIL program showing off SIL's Safe
+Interior Pointers. All of the uses of ``%2``, the interior pointer, are
+transitively uses of the base underlying object, ``%0``.
+
+The current list of interior pointer SIL instructions are:
+
+* `project_box`_ - projects a pointer out of a reference counted box. (*)
+* `ref_element_addr`_ - projects a field out of a reference counted class.
+* `ref_tail_addr`_ - projects out a pointer to a class’s tail allocated array
+  memory (assuming the class was initialized to have such an array).
+* `open_existential_box`_ - projects the address of the value out of a boxed
+  existential container using the current function context/protocol conformance
+  to create an "opened archetype".
+* `project_existential_box`_ - projects a pointer to the value inside a boxed
+  existential container. Must be the type for which the box was initially
+  allocated for and not for an "opened" archetype.
+
+(*) We still need to finish adding support for project_box, but all other
+interior pointers are guarded already.
+
+Dead End Blocks
+~~~~~~~~~~~~~~~
+
+In SIL, one can express that a program is semantically expected to exit at the
+end of a block by terminating the block with an `unreachable`_. Such a block is
+called a *program terminating block* and all blocks that are post-dominated by
+blocks of the aforementioned kind are called *dead end blocks*. Intuitively, any
+path through a dead end block is known to result in program termination, so
+resources that normally would need to be released back to the system will
+instead be returned to the system by process tear down.
+
+Since we rely on the system at these points to perform resource cleanup, we are
+able to loosen our lifetime requirements by allowing for values to not have
+their lifetimes ended along paths that end in program terminating
+blocks. Operationally, this implies that:
+
+* All SIL values must have exactly one lifetime ending use on all paths that
+  terminate in a `return`_ or `throw`_. In contrast, a SIL value does not need to
+  have a lifetime ending use along paths that end in an `unreachable`_.
+
+* `end_borrow`_ and `destroy_value`_ are redundent, albeit legal, in blocks
+  where all paths through the block end in an `unreachable`_.
+
+Consider the following legal SIL where we leak ``%0`` in blocks prefixed with
+``bbDeadEndBlock`` and consume it in ``bb2``::
+
+  sil @user : $@convention(thin) (@owned Klass) -> @owned Klass {
+  bb0(%0 : @owned $Klass):
+    cond_br ..., bb1, bb2
+
+  bb1:
+    // This is a dead end block since it is post-dominated by two dead end
+    // blocks. It is not a program terminating block though since the program
+    // does not end in this block.
+    cond_br ..., bbDeadEndBlock1, bbDeadEndBlock2
+
+  bbDeadEndBlock1:
+    // This is a dead end block and a program terminating block.
+    //
+    // We are exiting the program here causing the operating system to clean up
+    // all resources associated with our process, so there is no need for a
+    // destroy_value. That memory will be cleaned up anyways.
+    unreachable
+
+  bbDeadEndBlock2:
+    // This is a dead end block and a program terminating block.
+    //
+    // Even though we do not need to insert destroy_value along these paths, we
+    // can if we want to. It is just necessary and the optimizer can eliminate
+    // such a destroy_value if it wishes.
+    //
+    // NOTE: The author arbitrarily chose just to destroy %0: we could legally
+    // destroy either value (or both!).
+    destroy_value %0 : $Klass
+    unreachable
+
+  bb2:
+    cond_br ..., bb3, bb4
+
+  bb3:
+    // This block is live, so we need to ensure that %0 is consumed within the
+    // block. In this case, %0 is consumed by returning %0 to our caller.
+    return %0 : $Klass
+
+  bb4:
+    // This block is also live, but since we do not return %0, we must insert a
+    // destroy_value to cleanup %0.
+    //
+    // NOTE: The copy_value/destroy_value here is redundent and can be removed by
+    // the optimizer. The author left it in for illustrative purposes.
+    %1 = copy_value %0 : $Klass
+    destroy_value %0 : $Klass
+    return %1 : $Klass
+  }
 
 Runtime Failure
 ---------------
@@ -5022,7 +5374,7 @@ presence or value of the ``enum_extensibility`` Clang attribute.
 
 (See `SE-0192`__ for more information about non-frozen enums.)
 
-__ https://github.com/apple/swift-evolution/blob/master/proposals/0192-non-exhaustive-enums.md
+__ https://github.com/apple/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md
 
 enum
 ````
@@ -5722,6 +6074,25 @@ type ``B`` of the same size.
 This instruction is assumed to forward a fixed ownership (set upon its
 construction) and lowers to 'unchecked_bitwise_cast' in non-ossa code. This
 causes the cast to lose its guarantee of layout-compatibility.
+
+unchecked_ownership_conversion
+``````````````````````````````
+::
+
+   sil-instruction ::= 'unchecked_ownership_conversion' sil-operand ',' sil-value-ownership-kind 'to' sil-value-ownership-kind
+
+   %1 = unchecked_ownership_conversion %0 : $A, @guaranteed to @owned
+
+Converts its operand to an identical value of the same type but with
+different ownership without performing any semantic operations
+normally required by for ownership conversion.
+
+This is used in Objective-C compatible destructors to convert a
+guaranteed parameter to an owned parameter without performing a
+semantic copy.
+
+The resulting value must meet the usual ownership requirements; for
+example, a trivial type must have '.none' ownership.
 
 ref_to_raw_pointer
 ``````````````````
@@ -6634,7 +7005,7 @@ linear_function
   linear_function [parameters 0] %0 : $(T) -> T with_transpose %1 : $(T) -> T
 
 Bundles a function with its transpose function into a
-``@differentiable(linear)`` function.
+``@differentiable(_linear)`` function.
 
 ``[parameters ...]`` specifies parameter indices that the original function is
 linear with respect to.
@@ -6683,11 +7054,11 @@ linear_function_extract
 
   sil-linear-function-extractee ::= 'original' | 'transpose'
 
-  linear_function_extract [original] %0 : $@differentiable(linear) (T) -> T
-  linear_function_extract [transpose] %0 : $@differentiable(linear) (T) -> T
+  linear_function_extract [original] %0 : $@differentiable(_linear) (T) -> T
+  linear_function_extract [transpose] %0 : $@differentiable(_linear) (T) -> T
 
 Extracts the original function or a transpose function from the given
-``@differentiable(linear)`` function. The extractee is one of the following:
+``@differentiable(_linear)`` function. The extractee is one of the following:
 ``[original]`` or ``[transpose]``.
 
 
@@ -6698,6 +7069,7 @@ differentiability_witness_function
   sil-instruction ::=
       'differentiability_witness_function'
       '[' sil-differentiability-witness-function-kind ']'
+      '[' differentiability-kind ']'
       '[' 'parameters' sil-differentiability-witness-function-index-list ']'
       '[' 'results' sil-differentiability-witness-function-index-list ']'
       generic-parameter-clause?
@@ -6706,7 +7078,7 @@ differentiability_witness_function
   sil-differentiability-witness-function-kind ::= 'jvp' | 'vjp' | 'transpose'
   sil-differentiability-witness-function-index-list ::= [0-9]+ (' ' [0-9]+)*
 
-  differentiability_witness_function [jvp] [parameters 0] [results 0] \
+  differentiability_witness_function [vjp] [reverse] [parameters 0] [results 0] \
     <T where T: Differentiable> @foo : $(T) -> T
 
 Looks up a differentiability witness function (JVP, VJP, or transpose) for
@@ -6718,6 +7090,7 @@ look up: ``[jvp]``, ``[vjp]``, or ``[transpose]``.
 The remaining components identify the SIL differentiability witness:
 
 - Original function name.
+- Differentiability kind.
 - Parameter indices.
 - Result indices.
 - Witness generic parameter clause (optional). When parsing SIL, the parsed

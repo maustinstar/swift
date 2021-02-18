@@ -18,6 +18,7 @@
 #include "CodeSynthesis.h"
 #include "TypeChecker.h"
 #include "TypeCheckAvailability.h"
+#include "TypeCheckConcurrency.h"
 #include "TypeCheckDecl.h"
 #include "TypeCheckType.h"
 #include "swift/AST/ASTContext.h"
@@ -144,15 +145,10 @@ StoredPropertiesRequest::evaluate(Evaluator &evaluator,
   if (isa<SourceFile>(decl->getModuleScopeContext()))
     computeLoweredStoredProperties(decl);
 
-  ASTContext &ctx = decl->getASTContext();
   for (auto *member : decl->getMembers()) {
     if (auto *var = dyn_cast<VarDecl>(member))
       if (!var->isStatic() && var->hasStorage()) {
-        // Actor storage always goes at the beginning.
-        if (var->getName() == ctx.Id_actorStorage)
-          results.insert(results.begin(), var);
-        else
-          results.push_back(var);
+        results.push_back(var);
       }
   }
 
@@ -721,10 +717,16 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
       // Adjust the self type of the access to refer to the relevant superclass.
       auto *baseClass = override->getDeclContext()->getSelfClassDecl();
       selfTypeForAccess = selfTypeForAccess->getSuperclassForDecl(baseClass);
-      subs =
-        selfTypeForAccess->getContextSubstitutionMap(
-          accessor->getParentModule(),
-          baseClass);
+
+      // Error recovery path. We get an ErrorType here if getSuperclassForDecl()
+      // fails (because, for instance, a generic parameter of a generic nominal
+      // type cannot be resolved).
+      if (!selfTypeForAccess->is<ErrorType>()) {
+        subs =
+          selfTypeForAccess->getContextSubstitutionMap(
+            accessor->getParentModule(),
+            baseClass);
+      }
 
       storage = override;
 
@@ -1328,7 +1330,8 @@ synthesizeLazyGetterBody(AccessorDecl *Get, VarDecl *VD, VarDecl *Storage,
 
   // Recontextualize any closure declcontexts nested in the initializer to
   // realize that they are in the getter function.
-  Get->getImplicitSelfDecl()->setDeclContext(Get);
+  if (Get->hasImplicitSelfDecl())
+    Get->getImplicitSelfDecl()->setDeclContext(Get);
 
   InitValue->walk(RecontextualizeClosures(Get));
 
@@ -1361,7 +1364,8 @@ synthesizeLazyGetterBody(AccessorDecl *Get, VarDecl *VD, VarDecl *Storage,
 
   Body.push_back(new (Ctx) ReturnStmt(SourceLoc(), Tmp2DRE, /*implicit*/true));
 
-  return { BraceStmt::create(Ctx, VD->getLoc(), Body, VD->getLoc(),
+  auto Range = InitValue->getSourceRange();
+  return { BraceStmt::create(Ctx, Range.Start, Body, Range.End,
                              /*implicit*/true),
            /*isTypeChecked=*/true };
 }
@@ -1898,6 +1902,7 @@ static AccessorDecl *createGetterPrototype(AbstractStorageDecl *storage,
       getterParams,
       Type(),
       storage->getDeclContext());
+  getter->setSynthesized();
 
   // If we're stealing the 'self' from a lazy initializer, set it now.
   // Note that we don't re-parent the 'self' declaration to be part of
@@ -1947,6 +1952,7 @@ static AccessorDecl *createSetterPrototype(AbstractStorageDecl *storage,
       genericParams, params,
       Type(),
       storage->getDeclContext());
+  setter->setSynthesized();
 
   if (isMutating)
     setter->setSelfAccessKind(SelfAccessKind::Mutating);
@@ -2057,7 +2063,8 @@ createCoroutineAccessorPrototype(AbstractStorageDecl *storage,
       /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
       /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
       genericParams, params, retTy, dc);
-  
+  accessor->setSynthesized();
+
   if (isMutating)
     accessor->setSelfAccessKind(SelfAccessKind::Mutating);
   else
@@ -2308,6 +2315,8 @@ IsAccessorTransparentRequest::evaluate(Evaluator &evaluator,
       // Anything else should not have a synthesized setter.
       LLVM_FALLTHROUGH;
     case WriteImplKind::Immutable:
+      if (accessor->getASTContext().LangOpts.AllowModuleWithCompilerErrors)
+        return false;
       llvm_unreachable("should not be synthesizing accessor in this case");
 
     case WriteImplKind::StoredWithObservers:
@@ -2506,6 +2515,7 @@ static void typeCheckSynthesizedWrapperInitializer(
           dyn_cast_or_null<Initializer>(pbd->getInitContext(i))) {
     TypeChecker::contextualizeInitializer(initializerContext, initializer);
   }
+  checkPropertyWrapperActorIsolation(pbd, initializer);
   TypeChecker::checkPropertyWrapperEffects(pbd, initializer);
 }
 
@@ -2805,7 +2815,7 @@ static void finishProtocolStorageImplInfo(AbstractStorageDecl *storage,
   if (auto *var = dyn_cast<VarDecl>(storage)) {
     SourceLoc typeLoc;
     if (auto *repr = var->getTypeReprOrParentPatternTypeRepr())
-      typeLoc = repr->getLoc();
+      typeLoc = repr->getEndLoc();
     
     if (info.hasStorage()) {
       // Protocols cannot have stored properties.
@@ -2912,7 +2922,7 @@ static void finishPropertyWrapperImplInfo(VarDecl *var,
     return;
   }
 
-  if (var->hasObservers()) {
+  if (var->hasObservers() || var->getDeclContext()->isLocalContext()) {
     info = StorageImplInfo::getMutableComputed();
   } else {
     info = StorageImplInfo(ReadImplKind::Get, WriteImplKind::Set,

@@ -22,7 +22,9 @@
 #include "swift/AST/Initializer.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Sema/CSFix.h"
 #include "swift/Sema/ConstraintGraph.h"
@@ -36,6 +38,7 @@
 
 using namespace swift;
 using namespace constraints;
+using namespace inference;
 
 #define DEBUG_TYPE "ConstraintSystem"
 
@@ -83,6 +86,8 @@ ConstraintSystem::ConstraintSystem(DeclContext *dc,
       DC->getParentModule()->isMainModule()) {
     Options |= ConstraintSystemFlags::DebugConstraints;
   }
+  if (Context.LangOpts.UseClangFunctionTypes)
+    Options |= ConstraintSystemFlags::UseClangFunctionTypes;
 }
 
 ConstraintSystem::~ConstraintSystem() {
@@ -137,23 +142,16 @@ void ConstraintSystem::mergeEquivalenceClasses(TypeVariableType *typeVar1,
 bool ConstraintSystem::typeVarOccursInType(TypeVariableType *typeVar,
                                            Type type,
                                            bool *involvesOtherTypeVariables) {
-  SmallVector<TypeVariableType *, 4> typeVars;
+  SmallPtrSet<TypeVariableType *, 4> typeVars;
   type->getTypeVariables(typeVars);
-  bool result = false;
-  for (auto referencedTypeVar : typeVars) {
-    if (referencedTypeVar == typeVar) {
-      result = true;
-      if (!involvesOtherTypeVariables || *involvesOtherTypeVariables)
-        break;
 
-      continue;
-    }
-
-    if (involvesOtherTypeVariables)
-      *involvesOtherTypeVariables = true;
+  bool occurs = typeVars.count(typeVar);
+  if (involvesOtherTypeVariables) {
+    *involvesOtherTypeVariables =
+        occurs ? typeVars.size() > 1 : !typeVars.empty();
   }
 
-  return result;
+  return occurs;
 }
 
 void ConstraintSystem::assignFixedType(TypeVariableType *typeVar, Type type,
@@ -194,8 +192,9 @@ void ConstraintSystem::assignFixedType(TypeVariableType *typeVar, Type type,
       if (auto defaultType = TypeChecker::getDefaultType(literalProtocol, DC)) {
         // Check whether the nominal types match. This makes sure that we
         // properly handle Array vs. Array<T>.
-        if (defaultType->getAnyNominal() != type->getAnyNominal())
+        if (defaultType->getAnyNominal() != type->getAnyNominal()) {
           increaseScore(SK_NonDefaultLiteral);
+        }
       }
     }
   }
@@ -376,6 +375,13 @@ getAlternativeLiteralTypes(KnownProtocolKind kind) {
 
   AlternativeLiteralTypes[index] = allocateCopy(types);
   return *AlternativeLiteralTypes[index];
+}
+
+bool ConstraintSystem::containsCodeCompletionLoc(Expr *expr) const {
+  SourceRange range = expr->getSourceRange();
+  if (range.isInvalid())
+    return false;
+  return Context.SourceMgr.rangeContainsCodeCompletionLoc(range);
 }
 
 ConstraintLocator *ConstraintSystem::getConstraintLocator(
@@ -1894,6 +1900,7 @@ static std::pair<Type, Type> getTypeOfReferenceWithSpecialTypeCheckingSemantics(
     auto bodyClosure = FunctionType::get(arg, result,
                                          FunctionType::ExtInfoBuilder()
                                              .withNoEscape(true)
+                                             .withAsync(true)
                                              .withThrows(true)
                                              .build());
     FunctionType::Param args[] = {
@@ -1904,6 +1911,7 @@ static std::pair<Type, Type> getTypeOfReferenceWithSpecialTypeCheckingSemantics(
     auto refType = FunctionType::get(args, result,
                                      FunctionType::ExtInfoBuilder()
                                          .withNoEscape(false)
+                                         .withAsync(true)
                                          .withThrows(true)
                                          .build());
     return {refType, refType};
@@ -2136,14 +2144,6 @@ std::pair<Type, bool> ConstraintSystem::adjustTypeOfOverloadReference(
   llvm_unreachable("Unhandled OverloadChoiceKind in switch.");
 }
 
-/// Whether the declaration is considered 'async'.
-static bool isDeclAsync(ValueDecl *value) {
-  if (auto func = dyn_cast<AbstractFunctionDecl>(value))
-    return func->isAsyncContext();
-
-  return false;
-}
-
 /// Walk a closure AST to determine its effects.
 ///
 /// \returns a function's extended info describing the effects, as
@@ -2295,6 +2295,13 @@ FunctionType::ExtInfo ConstraintSystem::closureEffects(ClosureExpr *expr) {
         return { false, stmt };
       }
 
+      if (auto forEach = dyn_cast<ForEachStmt>(stmt)) {
+        if (forEach->getTryLoc().isValid()) {
+          FoundThrow = true;
+          return { false, nullptr };
+        }
+      }
+
       return { true, stmt };
     }
 
@@ -2332,6 +2339,17 @@ FunctionType::ExtInfo ConstraintSystem::closureEffects(ClosureExpr *expr) {
       return true;
     }
 
+    std::pair<bool, Stmt *> walkToStmtPre(Stmt *stmt) override { 
+      if (auto forEach = dyn_cast<ForEachStmt>(stmt)) {
+        if (forEach->getAwaitLoc().isValid()) {
+          FoundAsync = true;
+          return { false, nullptr };
+        }
+      }
+
+      return { true, stmt };
+    }
+
   public:
     bool foundAsync() { return FoundAsync; }
   };
@@ -2366,7 +2384,7 @@ FunctionType::ExtInfo ConstraintSystem::closureEffects(ClosureExpr *expr) {
 
 bool ConstraintSystem::isAsynchronousContext(DeclContext *dc) {
   if (auto func = dyn_cast<AbstractFunctionDecl>(dc))
-    return isDeclAsync(func);
+    return func->isAsyncContext();
 
   if (auto closure = dyn_cast<ClosureExpr>(dc))
     return closureEffects(closure).isAsync();
@@ -2700,8 +2718,10 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
   if (auto *decl = choice.getDeclOrNull()) {
     // If we're choosing an asynchronous declaration within a synchronous
     // context, or vice-versa, increase the async/async mismatch score.
-    if (isAsynchronousContext(useDC) != isDeclAsync(decl))
-      increaseScore(SK_AsyncSyncMismatch);
+    if (auto func = dyn_cast<AbstractFunctionDecl>(decl)) {
+      if (func->isAsyncContext() != isAsynchronousContext(useDC))
+        increaseScore(SK_AsyncSyncMismatch);
+    }
 
     // If we're binding to an init member, the 'throws' need to line up
     // between the bound and reference types.
@@ -2793,6 +2813,10 @@ void ConstraintSystem::resolveOverload(ConstraintLocator *locator,
   if (choice.isDecl() &&
       choice.getDecl()->getAttrs().hasAttribute<DisfavoredOverloadAttr>()) {
     increaseScore(SK_DisfavoredOverload);
+  }
+
+  if (choice.isFallbackMemberOnUnwrappedBase()) {
+    increaseScore(SK_UnresolvedMemberViaOptional);
   }
 }
 
@@ -2894,8 +2918,7 @@ size_t Solution::getTotalMemory() const {
          ConstraintRestrictions.getMemorySize() +
          llvm::capacity_in_bytes(Fixes) + DisjunctionChoices.getMemorySize() +
          OpenedTypes.getMemorySize() + OpenedExistentialTypes.getMemorySize() +
-         (DefaultedConstraints.size() * sizeof(void *)) +
-         Conformances.size() * sizeof(std::pair<ConstraintLocator *, ProtocolConformanceRef>);
+         (DefaultedConstraints.size() * sizeof(void *));
 }
 
 DeclContext *Solution::getDC() const { return constraintSystem->DC; }
@@ -3399,6 +3422,30 @@ static bool diagnoseAmbiguity(
 
   auto &DE = cs.getASTContext().Diags;
 
+  llvm::SmallPtrSet<ValueDecl *, 4> localAmbiguity;
+  {
+    for (auto &entry : aggregateFix) {
+      const auto &solution = entry.first;
+      const auto &overload = solution->getOverloadChoice(ambiguity.locator);
+      auto *choice = overload.choice.getDeclOrNull();
+
+      // It's not possible to diagnose different kinds of overload choices.
+      if (!choice)
+        return false;
+
+      localAmbiguity.insert(choice);
+    }
+  }
+
+  if (localAmbiguity.empty())
+    return false;
+
+  // If all of the fixes are rooted in the same choice.
+  if (localAmbiguity.size() == 1) {
+    auto &primaryFix = aggregateFix.front();
+    return primaryFix.second->diagnose(*primaryFix.first);
+  }
+
   {
     auto fixKind = aggregateFix.front().second->getKind();
     if (llvm::all_of(
@@ -3413,10 +3460,7 @@ static bool diagnoseAmbiguity(
     }
   }
 
-  auto *decl = ambiguity.choices.front().getDeclOrNull();
-  if (!decl)
-    return false;
-
+  auto *decl = *localAmbiguity.begin();
   auto *commonCalleeLocator = ambiguity.locator;
 
   bool diagnosed = true;
@@ -4379,9 +4423,16 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
     // If we didn't resolve an overload for the callee, we should be dealing
     // with a call of an arbitrary function expr.
     auto *call = castToExpr<CallExpr>(anchor);
+    rawFnType = getType(call->getFn());
+
+    // If callee couldn't be resolved due to expression
+    // issues e.g. it's a reference to an invalid member
+    // let's just return here.
+    if (simplifyType(rawFnType)->is<UnresolvedType>())
+      return None;
+
     assert(!shouldHaveDirectCalleeOverload(call) &&
              "Should we have resolved a callee for this?");
-    rawFnType = getType(call->getFn());
   }
 
   // Try to resolve the function type by loading lvalues and looking through
@@ -5048,23 +5099,34 @@ void ConstraintSystem::diagnoseFailureFor(SolutionApplicationTarget target) {
 
 bool ConstraintSystem::isDeclUnavailable(const Decl *D,
                                          ConstraintLocator *locator) const {
-  auto &ctx = getASTContext();
-
   // First check whether this declaration is universally unavailable.
-  if (D->getAttrs().isUnavailable(ctx))
+  if (D->getAttrs().isUnavailable(getASTContext()))
     return true;
 
-  SourceLoc loc;
+  return TypeChecker::isDeclarationUnavailable(D, DC, [&] {
+    SourceLoc loc;
 
-  if (locator) {
-    if (auto anchor = locator->getAnchor())
-      loc = getLoc(anchor);
-  }
+    if (locator) {
+      if (auto anchor = locator->getAnchor())
+        loc = getLoc(anchor);
+    }
 
-  // If not, let's check contextual unavailability.
-  ExportContext where = ExportContext::forFunctionBody(DC, loc);
-  auto result = TypeChecker::checkDeclarationAvailability(D, where);
-  return result.hasValue();
+    return TypeChecker::overApproximateAvailabilityAtLocation(loc, DC);
+  });
+}
+
+bool ConstraintSystem::isConformanceUnavailable(ProtocolConformanceRef conformance,
+                                                ConstraintLocator *locator) const {
+  if (!conformance.isConcrete())
+    return false;
+
+  auto *concrete = conformance.getConcrete();
+  auto *rootConf = concrete->getRootConformance();
+  auto *ext = dyn_cast<ExtensionDecl>(rootConf->getDeclContext());
+  if (ext == nullptr)
+    return false;
+
+  return isDeclUnavailable(ext, locator);
 }
 
 /// If we aren't certain that we've emitted a diagnostic, emit a fallback
@@ -5111,22 +5173,12 @@ static Optional<Requirement> getRequirement(ConstraintSystem &cs,
     return None;
 
   if (reqLoc->isConditionalRequirement()) {
-    auto path = reqLocator->getPath();
-    auto *typeReqLoc =
-        cs.getConstraintLocator(reqLocator->getAnchor(), path.drop_back());
+    auto conformanceRef =
+        reqLocator->findLast<LocatorPathElt::ConformanceRequirement>();
+    assert(conformanceRef && "Invalid locator for a conditional requirement");
 
-    auto conformances = cs.getCheckedConformances();
-    auto result = llvm::find_if(
-        conformances,
-        [&typeReqLoc](
-            const std::pair<ConstraintLocator *, ProtocolConformanceRef>
-                &conformance) { return conformance.first == typeReqLoc; });
-    assert(result != conformances.end());
-
-    auto conformance = result->second;
-    assert(conformance.isConcrete());
-
-    return conformance.getConditionalRequirements()[reqLoc->getIndex()];
+    auto conformance = conformanceRef->getConformance();
+    return conformance->getConditionalRequirements()[reqLoc->getIndex()];
   }
 
   if (auto openedGeneric =
@@ -5257,4 +5309,126 @@ bool ConstraintSystem::isReadOnlyKeyPathComponent(
   }
 
   return false;
+}
+
+TypeVarBindingProducer::TypeVarBindingProducer(PotentialBindings &bindings)
+    : BindingProducer(bindings.CS, bindings.TypeVar->getImpl().getLocator()),
+      TypeVar(bindings.TypeVar), CanBeNil(bindings.canBeNil()) {
+  if (bindings.isDirectHole()) {
+    auto *locator = getLocator();
+    // If this type variable is associated with a code completion token
+    // and it failed to infer any bindings let's adjust hole's locator
+    // to point to a code completion token to avoid attempting to "fix"
+    // this problem since its rooted in the fact that constraint system
+    // is under-constrained.
+    if (bindings.AssociatedCodeCompletionToken) {
+      locator = CS.getConstraintLocator(bindings.AssociatedCodeCompletionToken);
+    }
+
+    Bindings.push_back(Binding::forHole(TypeVar, locator));
+    return;
+  }
+
+  // A binding to `Any` which should always be considered as a last resort.
+  Optional<Binding> Any;
+
+  auto addBinding = [&](const Binding &binding) {
+    // Adjust optionality of existing bindings based on presence of
+    // `ExpressibleByNilLiteral` requirement.
+    if (requiresOptionalAdjustment(binding)) {
+      Bindings.push_back(
+          binding.withType(OptionalType::get(binding.BindingType)));
+    } else if (binding.BindingType->isAny()) {
+      Any.emplace(binding);
+    } else {
+      Bindings.push_back(binding);
+    }
+  };
+
+  for (const auto &binding : bindings.Bindings) {
+    addBinding(binding);
+  }
+
+  // Infer defaults based on "uncovered" literal protocol requirements.
+  for (const auto &info : bindings.Literals) {
+    const auto &literal = info.second;
+
+    if (!literal.viableAsBinding())
+      continue;
+
+    // We need to figure out whether this is a direct conformance
+    // requirement or inferred transitive one to identify binding
+    // kind correctly.
+    addBinding({literal.getDefaultType(),
+                literal.isDirectRequirement() ? BindingKind::Subtypes
+                                              : BindingKind::Supertypes,
+                literal.getSource()});
+  }
+
+  // Let's always consider `Any` to be a last resort binding because
+  // it's always better to infer concrete type and erase it if required
+  // by the context.
+  if (Any) {
+    Bindings.push_back(*Any);
+  }
+
+  {
+    bool noBindings = Bindings.empty();
+
+    for (const auto &entry : bindings.Defaults) {
+      auto *constraint = entry.second;
+      if (noBindings) {
+        // If there are no direct or transitive bindings to attempt
+        // let's add defaults to the list right away.
+        Bindings.push_back(getDefaultBinding(constraint));
+      } else {
+        // Otherwise let's delay attempting default bindings
+        // until all of the direct & transitive bindings and
+        // their derivatives have been attempted.
+        DelayedDefaults.push_back(constraint);
+      }
+    }
+  }
+}
+
+bool TypeVarBindingProducer::requiresOptionalAdjustment(
+    const Binding &binding) const {
+  // If type variable can't be `nil` then adjustment is
+  // not required.
+  if (!CanBeNil)
+    return false;
+
+  if (binding.Kind == BindingKind::Supertypes) {
+    auto type = binding.BindingType->getRValueType();
+    // If the type doesn't conform to ExpressibleByNilLiteral,
+    // produce an optional of that type as a potential binding. We
+    // overwrite the binding in place because the non-optional type
+    // will fail to type-check against the nil-literal conformance.
+    bool conformsToExprByNilLiteral = false;
+    if (auto *nominalBindingDecl = type->getAnyNominal()) {
+      SmallVector<ProtocolConformance *, 2> conformances;
+      conformsToExprByNilLiteral = nominalBindingDecl->lookupConformance(
+          CS.DC->getParentModule(),
+          CS.getASTContext().getProtocol(
+              KnownProtocolKind::ExpressibleByNilLiteral),
+          conformances);
+    }
+    return !conformsToExprByNilLiteral;
+  } else if (binding.isDefaultableBinding() && binding.BindingType->isAny()) {
+    return true;
+  }
+
+  return false;
+}
+
+PotentialBinding
+TypeVarBindingProducer::getDefaultBinding(Constraint *constraint) const {
+  assert(constraint->getKind() == ConstraintKind::Defaultable ||
+         constraint->getKind() == ConstraintKind::DefaultClosureType);
+
+  auto type = constraint->getSecondType();
+  Binding binding{type, BindingKind::Exact, constraint};
+  return requiresOptionalAdjustment(binding)
+             ? binding.withType(OptionalType::get(type))
+             : binding;
 }

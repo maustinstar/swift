@@ -335,10 +335,19 @@ def create_argument_parser():
            help='enable code coverage analysis in Swift (false, not-merged, '
                 'merged).')
 
+    option('--swift-disable-dead-stripping', toggle_true, 
+           help="Turn off Darwin-specific dead stripping for Swift host tools")
+
     option('--build-subdir', store,
            metavar='PATH',
            help='name of the directory under $SWIFT_BUILD_ROOT where the '
                 'build products will be placed')
+    option('--relocate-xdg-cache-home-under-build-subdir',
+           store_true,
+           help='relocate $XDG_CACHE_HOME to the same location '
+                'where build products will be placed; '
+                'this supports having multiple runs for different branches '
+                'in CI bots for Linux')
     option('--install-prefix', store_path,
            default=targets.install_prefix(),
            help='The installation prefix. This is where built Swift products '
@@ -374,6 +383,15 @@ def create_argument_parser():
     option('--host-cxx', store_path(executable=True),
            help='the absolute path to CXX, the "clang++" compiler for the '
                 'host platform. Default is auto detected.')
+    option('--native-swift-tools-path', store_path,
+           help='the path to a directory that contains prebuilt Swift tools '
+                'that are executable on the host platform')
+    option('--native-clang-tools-path', store_path,
+           help='the path to a directory that contains prebuilt Clang tools '
+                'that are executable on the host platform')
+    option('--native-llvm-tools-path', store_path,
+           help='the path to a directory that contains prebuilt LLVM tools '
+                'that are executable on the host platform')
     option('--cmake-c-launcher', store_path(executable=True),
            default=os.environ.get('C_COMPILER_LAUNCHER', None),
            help='the absolute path to set CMAKE_C_COMPILER_LAUNCHER')
@@ -485,6 +503,13 @@ def create_argument_parser():
            metavar='COUNT',
            help='the maximum number of parallel link jobs to use when '
                 'compiling swift tools.')
+
+    option('--dsymutil-jobs', store_int,
+           default=defaults.DSYMUTIL_JOBS,
+           metavar='COUNT',
+           help='the maximum number of parallel dsymutil jobs to use when '
+                'extracting symbols. Tweak with caution, since dsymutil'
+                'is memory intensive.')
 
     option('--disable-guaranteed-normal-arguments', store_true,
            help='Disable guaranteed normal arguments')
@@ -973,6 +998,7 @@ def create_argument_parser():
            help='skip testing iOS simulator targets')
     option('--skip-test-ios-32bit-simulator',
            toggle_false('test_ios_32bit_simulator'),
+           default=False,
            help='skip testing iOS 32 bit simulator targets')
     option('--skip-test-ios-host',
            toggle_false('test_ios_host'),
@@ -1087,10 +1113,10 @@ def create_argument_parser():
                     android.adb.commands.DEVICE_TEMP_DIR))
 
     option('--android-arch', store,
-           choices=['armv7', 'aarch64'],
+           choices=['armv7', 'aarch64', 'x86_64'],
            default='armv7',
-           help='The Android target architecture when building for Android. '
-                'Currently only armv7 and aarch64 are supported. '
+           help='The target architecture when building for Android. '
+                'Currently, only armv7, aarch64, and x86_64 are supported. '
                 '%(default)s is the default.')
 
     # -------------------------------------------------------------------------

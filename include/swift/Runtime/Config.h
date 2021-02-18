@@ -176,6 +176,21 @@ extern uintptr_t __COMPATIBILITY_LIBRARIES_CANNOT_CHECK_THE_IS_SWIFT_BIT_DIRECTL
 #define SWIFT_INDIRECT_RESULT
 #endif
 
+#if __has_attribute(swift_async_context)
+#define SWIFT_ASYNC_CONTEXT __attribute__((swift_async_context))
+#else
+#define SWIFT_ASYNC_CONTEXT
+#endif
+
+// SWIFT_CC(swiftasync) is the Swift async calling convention.
+// We assume that it supports mandatory tail call elimination.
+#if __has_feature(swiftasynccc) && USE_SWIFT_ASYNC_LOWERING && \
+    __has_attribute(swiftasynccall)
+#define SWIFT_CC_swiftasync __attribute__((swiftasynccall))
+#else
+#define SWIFT_CC_swiftasync SWIFT_CC_swift
+#endif
+
 // SWIFT_CC(PreserveMost) is used in the runtime implementation to prevent
 // register spills on the hot path.
 // It is not safe to use for external calls; the loader's lazy function
@@ -308,6 +323,17 @@ static inline T swift_auth_data_non_address(T value, unsigned extra) {
   return (T)ptrauth_auth_data((void *)value,
                                ptrauth_key_process_independent_data,
                                extra);
+#else
+  return value;
+#endif
+}
+
+template <typename T>
+SWIFT_RUNTIME_ATTRIBUTE_ALWAYS_INLINE static inline T
+swift_auth_code(T value, unsigned extra) {
+#if SWIFT_PTRAUTH
+  return (T)ptrauth_auth_function((void *)value,
+                                  ptrauth_key_process_independent_code, extra);
 #else
   return value;
 #endif

@@ -186,6 +186,10 @@ extension SIMD${n} where Scalar: BinaryFloatingPoint {
   }
 }
 
+extension SIMD${n}: ConcurrentValue
+  where Scalar: ConcurrentValue,
+        Scalar.SIMD${storageN}Storage: ConcurrentValue { }
+
 %end
 
 extension SIMD3 {
@@ -217,7 +221,7 @@ extension ${Self}: SIMDScalar {
   /// Storage for a vector of ${spelledNumbers[n]} integers.
   @frozen
   @_alignment(${bytes if bytes <= 16 else 16})
-  public struct SIMD${n}Storage: SIMDStorage {
+  public struct SIMD${n}Storage: SIMDStorage, ConcurrentValue {
 
     public var _value: Builtin.Vec${n}x${BuiltinName}
 
@@ -253,11 +257,10 @@ extension ${Self}: SIMDScalar {
 %end
 
 %for (Self, bits) in [('Float16',16), ('Float',32), ('Double',64)]:
-%if bits == 16:
-@available(iOS 14.0, watchOS 7.0, tvOS 14.0, *)
-@available(macOS, unavailable)
-@available(macCatalyst, unavailable)
-%end
+% if bits == 16:
+#if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+@available(macOS 11.0, iOS 14.0, watchOS 7.0, tvOS 14.0, *)
+% end
 extension ${Self} : SIMDScalar {
 
   public typealias SIMDMaskScalar = Int${bits}
@@ -267,7 +270,7 @@ extension ${Self} : SIMDScalar {
   /// Storage for a vector of ${spelledNumbers[n]} floating-point values.
   @frozen
   @_alignment(${bytes if bytes <= 16 else 16})
-  public struct SIMD${n}Storage: SIMDStorage {
+  public struct SIMD${n}Storage: SIMDStorage, ConcurrentValue {
 
     public var _value: Builtin.Vec${n}xFPIEEE${bits}
 
@@ -299,5 +302,8 @@ extension ${Self} : SIMDScalar {
 
 % end
 }
+% if bits == 16:
+#endif
+% end
 
 %end

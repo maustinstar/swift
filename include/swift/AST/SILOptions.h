@@ -153,6 +153,10 @@ public:
   /// Emit extra exclusvity markers for memory access and verify coverage.
   bool VerifyExclusivity = false;
 
+  /// When building the stdlib with opts should we lower ownership after
+  /// serialization? Otherwise we do before.
+  bool SerializeStdlibWithOwnershipWithOpts = true;
+
   /// Calls to the replaced method inside of the replacement method will call
   /// the previous implementation.
   ///
@@ -162,9 +166,6 @@ public:
   ///     original() // calls original() implementation if true
   /// }
   bool EnableDynamicReplacementCanCallPreviousImplementation = true;
-
-  /// Enable large loadable types IRGen pass.
-  bool EnableLargeLoadableTypes = true;
 
   /// The name of the file to which the backend should save optimization
   /// records.

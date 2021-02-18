@@ -268,14 +268,30 @@ protected:
   }
 
   void visitPatternBindingDecl(PatternBindingDecl *patternBinding) {
-    // If any of the entries lacks an initializer, don't handle this node.
-    if (!llvm::all_of(range(patternBinding->getNumPatternEntries()),
-                      [&](unsigned index) {
-            return patternBinding->isExplicitlyInitialized(index);
-        })) {
-      if (!unhandledNode)
-        unhandledNode = patternBinding;
-      return;
+    // Enforce some restrictions on local variables inside a result builder.
+    for (unsigned i : range(patternBinding->getNumPatternEntries())) {
+      // The pattern binding must have an initial value expression.
+      if (!patternBinding->isExplicitlyInitialized(i)) {
+        if (!unhandledNode)
+          unhandledNode = patternBinding;
+        return;
+      }
+
+      // Each variable bound by the pattern must be stored, and cannot
+      // have observers.
+      SmallVector<VarDecl *, 8> variables;
+      patternBinding->getPattern(i)->collectVariables(variables);
+
+      for (auto *var : variables) {
+        if (!var->getImplInfo().isSimpleStored()) {
+          if (!unhandledNode)
+            unhandledNode = patternBinding;
+          return;
+        }
+
+        // Also check for invalid attributes.
+        TypeChecker::checkDeclAttributes(var);
+      }
     }
 
     // If there is a constraint system, generate constraints for the pattern
@@ -738,8 +754,13 @@ protected:
     // statements by excluding invalid cases.
     if (auto *BS = dyn_cast<BraceStmt>(body)) {
       if (BS->getNumElements() == 0) {
-        hadError = true;
-        return nullptr;
+        // HACK: still allow empty bodies if typechecking for code
+        // completion. Code completion ignores diagnostics
+        // and won't get any types if we fail.
+        if (!ctx.SourceMgr.hasCodeCompletionBuffer()) {
+          hadError = true;
+          return nullptr;
+        }
       }
     }
 
@@ -774,7 +795,8 @@ protected:
     // take care of this.
     auto sequenceProto = TypeChecker::getProtocol(
         dc->getASTContext(), forEachStmt->getForLoc(),
-        KnownProtocolKind::Sequence);
+        forEachStmt->getAwaitLoc().isValid() ? 
+          KnownProtocolKind::AsyncSequence : KnownProtocolKind::Sequence);
     if (!sequenceProto) {
       if (!unhandledNode)
         unhandledNode = forEachStmt;
@@ -1158,6 +1180,12 @@ public:
             stmt,
             ResultBuilderTarget{ResultBuilderTarget::TemporaryVar,
                                   std::move(captured)});
+
+        // Re-write of statements that envolve type-checking
+        // could fail, such a failure terminates the walk.
+        if (!finalStmt)
+          return nullptr;
+
         newElements.push_back(finalStmt);
         continue;
       }
@@ -1512,7 +1540,7 @@ BraceStmt *swift::applyResultBuilderTransform(
           rewriteTarget) {
   BuilderClosureRewriter rewriter(solution, dc, applied, rewriteTarget);
   auto captured = rewriter.takeCapturedStmt(body);
-  return cast<BraceStmt>(
+  return cast_or_null<BraceStmt>(
     rewriter.visitBraceStmt(
       body,
       ResultBuilderTarget::forReturn(applied.returnExpr),
@@ -1548,7 +1576,7 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
 
     ctx.Diags.diagnose(
         returnStmts.front()->getReturnLoc(),
-        diag::result_builder_disabled_by_return, builderType);
+        diag::result_builder_disabled_by_return_warn, builderType);
 
     // Note that one can remove the result builder attribute.
     auto attr = func->getAttachedResultBuilder();
@@ -1665,7 +1693,7 @@ ConstraintSystem::matchResultBuilder(
   if (InvalidResultBuilderBodies.count(fn)) {
     (void)recordFix(
         IgnoreInvalidResultBuilderBody::duringConstraintGeneration(
-            *this, getConstraintLocator(fn.getBody())));
+            *this, getConstraintLocator(fn.getAbstractClosureExpr())));
     return getTypeMatchSuccess();
   }
 
@@ -1684,13 +1712,25 @@ ConstraintSystem::matchResultBuilder(
       return getTypeMatchFailure(locator);
 
     if (recordFix(IgnoreInvalidResultBuilderBody::duringPreCheck(
-            *this, getConstraintLocator(fn.getBody()))))
+            *this, getConstraintLocator(fn.getAbstractClosureExpr()))))
       return getTypeMatchFailure(locator);
 
     return getTypeMatchSuccess();
   }
 
   case ResultBuilderBodyPreCheck::HasReturnStmt:
+    // Diagnostic mode means that solver couldn't reach any viable
+    // solution, so let's diagnose presence of a `return` statement
+    // in the closure body.
+    if (shouldAttemptFixes()) {
+      if (recordFix(IgnoreResultBuilderWithReturnStmts::create(
+              *this, builderType,
+              getConstraintLocator(fn.getAbstractClosureExpr()))))
+        return getTypeMatchFailure(locator);
+
+      return getTypeMatchSuccess();
+    }
+
     // If the body has a return statement, suppress the transform but
     // continue solving the constraint system.
     return None;
@@ -1738,7 +1778,7 @@ ConstraintSystem::matchResultBuilder(
 
       if (recordFix(
               IgnoreInvalidResultBuilderBody::duringConstraintGeneration(
-                  *this, getConstraintLocator(fn.getBody()))))
+                  *this, getConstraintLocator(fn.getAbstractClosureExpr()))))
         return getTypeMatchFailure(locator);
 
       return getTypeMatchSuccess();

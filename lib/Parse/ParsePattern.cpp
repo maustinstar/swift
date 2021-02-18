@@ -70,7 +70,7 @@ static ParserStatus parseDefaultArgument(
   SourceLoc equalLoc = P.consumeToken();
 
   if (P.SF.Kind == SourceFileKind::Interface) {
-    // Swift module interfaces don't synthesize inherited intializers and
+    // Swift module interfaces don't synthesize inherited initializers and
     // instead include them explicitly in subclasses. Since the
     // \c DefaultArgumentKind of these initializers is \c Inherited, this is
     // represented textually as `= super` in the interface.
@@ -761,7 +761,7 @@ Parser::parseFunctionArguments(SmallVectorImpl<Identifier> &NamePieces,
 
 /// Parse a function definition signature.
 ///   func-signature:
-///     func-arguments 'async'? func-throws? func-signature-result?
+///     func-arguments ('async'|'reasync')? func-throws? func-signature-result?
 ///   func-signature-result:
 ///     '->' type
 ///
@@ -772,6 +772,7 @@ Parser::parseFunctionSignature(Identifier SimpleName,
                                ParameterList *&bodyParams,
                                DefaultArgumentInfo &defaultArgs,
                                SourceLoc &asyncLoc,
+                               bool &reasync,
                                SourceLoc &throwsLoc,
                                bool &rethrows,
                                TypeRepr *&retType) {
@@ -786,8 +787,11 @@ Parser::parseFunctionSignature(Identifier SimpleName,
   FullName = DeclName(Context, SimpleName, NamePieces);
 
   // Check for the 'async' and 'throws' keywords.
+  reasync = false;
   rethrows = false;
-  parseAsyncThrows(SourceLoc(), asyncLoc, throwsLoc, &rethrows);
+  Status |= parseEffectsSpecifiers(SourceLoc(),
+                                   asyncLoc, &reasync,
+                                   throwsLoc, &rethrows);
 
   // If there's a trailing arrow, parse the rest as the result type.
   SourceLoc arrowLoc;
@@ -800,9 +804,9 @@ Parser::parseFunctionSignature(Identifier SimpleName,
       arrowLoc = consumeToken(tok::colon);
     }
 
-    // Check for 'throws' and 'rethrows' after the arrow, but
-    // before the type, and correct it.
-    parseAsyncThrows(arrowLoc, asyncLoc, throwsLoc, &rethrows);
+    // Check for effect specifiers after the arrow, but before the type, and
+    // correct it.
+    parseEffectsSpecifiers(arrowLoc, asyncLoc, &reasync, throwsLoc, &rethrows);
 
     ParserResult<TypeRepr> ResultType =
         parseDeclResultType(diag::expected_type_function_result);
@@ -811,8 +815,8 @@ Parser::parseFunctionSignature(Identifier SimpleName,
     if (Status.isErrorOrHasCompletion())
       return Status;
 
-    // Check for 'throws' and 'rethrows' after the type and correct it.
-    parseAsyncThrows(arrowLoc, asyncLoc, throwsLoc, &rethrows);
+    // Check for effect specifiers after the type and correct it.
+    parseEffectsSpecifiers(arrowLoc, asyncLoc, &reasync, throwsLoc, &rethrows);
   } else {
     // Otherwise, we leave retType null.
     retType = nullptr;
@@ -821,52 +825,115 @@ Parser::parseFunctionSignature(Identifier SimpleName,
   return Status;
 }
 
-void Parser::parseAsyncThrows(
-    SourceLoc existingArrowLoc, SourceLoc &asyncLoc, SourceLoc &throwsLoc,
-    bool *rethrows) {
-  if (shouldParseExperimentalConcurrency() &&
-      Tok.isContextualKeyword("async")) {
-    asyncLoc = consumeToken();
+bool Parser::isEffectsSpecifier(const Token &T) {
+  // NOTE: If this returns 'true', that token must be handled in
+  //       'parseEffectsSpecifiers()'.
 
-    if (existingArrowLoc.isValid()) {
-      diagnose(asyncLoc, diag::async_or_throws_in_wrong_position, 2)
-        .fixItRemove(asyncLoc)
-        .fixItInsert(existingArrowLoc, "async ");
+  if (T.isContextualKeyword("async") ||
+      T.isContextualKeyword("reasync"))
+    return true;
+
+  if (T.isAny(tok::kw_throws, tok::kw_rethrows) ||
+      (T.isAny(tok::kw_throw, tok::kw_try) && !T.isAtStartOfLine()))
+    return true;
+
+  return false;
+}
+
+ParserStatus Parser::parseEffectsSpecifiers(SourceLoc existingArrowLoc,
+                                            SourceLoc &asyncLoc,
+                                            bool *reasync,
+                                            SourceLoc &throwsLoc,
+                                            bool *rethrows) {
+  ParserStatus status;
+
+  while (true) {
+    // 'async'
+    bool isReasync = Tok.isContextualKeyword("reasync");
+    if (Tok.isContextualKeyword("async") ||
+        isReasync) {
+      if (asyncLoc.isValid()) {
+        diagnose(Tok, diag::duplicate_effects_specifier, Tok.getText())
+            .highlight(asyncLoc)
+            .fixItRemove(Tok.getLoc());
+      } else if (!reasync && isReasync) {
+        // Replace 'reasync' with 'async' unless it's allowed.
+        diagnose(Tok, diag::reasync_function_type)
+            .fixItReplace(Tok.getLoc(), "async");
+      } else if (existingArrowLoc.isValid()) {
+        SourceLoc insertLoc = existingArrowLoc;
+        if (throwsLoc.isValid() &&
+            SourceMgr.isBeforeInBuffer(throwsLoc, insertLoc))
+          insertLoc = throwsLoc;
+        diagnose(Tok, diag::async_or_throws_in_wrong_position,
+                 (reasync && isReasync) ? "reasync" : "async")
+            .fixItRemove(Tok.getLoc())
+            .fixItInsert(insertLoc,
+                         (reasync && isReasync) ? "reasync " : "async ");
+      } else if (throwsLoc.isValid()) {
+        // 'async' cannot be after 'throws'.
+        assert(existingArrowLoc.isInvalid());
+        diagnose(Tok, diag::async_after_throws,
+                 reasync && isReasync,
+                 rethrows && *rethrows)
+            .fixItRemove(Tok.getLoc())
+            .fixItInsert(throwsLoc, isReasync ? "reasync " : "async ");
+      }
+      if (asyncLoc.isInvalid()) {
+        if (reasync)
+          *reasync = isReasync;
+        asyncLoc = Tok.getLoc();
+      }
+      consumeToken();
+      continue;
     }
+
+    // 'throws'/'rethrows', or diagnose 'throw'/'try'.
+    if (Tok.isAny(tok::kw_throws, tok::kw_rethrows) ||
+        (Tok.isAny(tok::kw_throw, tok::kw_try) && !Tok.isAtStartOfLine())) {
+      bool isRethrows = Tok.is(tok::kw_rethrows);
+
+      if (throwsLoc.isValid()) {
+        diagnose(Tok, diag::duplicate_effects_specifier, Tok.getText())
+            .highlight(throwsLoc)
+            .fixItRemove(Tok.getLoc());
+      } else if (Tok.isAny(tok::kw_throw, tok::kw_try)) {
+        // Replace 'throw' or 'try' with 'throws'.
+        diagnose(Tok, diag::throw_in_function_type)
+            .fixItReplace(Tok.getLoc(), "throws");
+      } else if (!rethrows && isRethrows) {
+        // Replace 'rethrows' with 'throws' unless it's allowed.
+        diagnose(Tok, diag::rethrowing_function_type)
+            .fixItReplace(Tok.getLoc(), "throws");
+      } else if (existingArrowLoc.isValid()) {
+        diagnose(Tok, diag::async_or_throws_in_wrong_position, Tok.getText())
+            .fixItRemove(Tok.getLoc())
+            .fixItInsert(existingArrowLoc, (Tok.getText() + " ").str());
+      }
+
+      if (throwsLoc.isInvalid()) {
+        if (rethrows)
+          *rethrows = isRethrows;
+        throwsLoc = Tok.getLoc();
+      }
+      consumeToken();
+      continue;
+    }
+
+    // Code completion.
+    if (Tok.is(tok::code_complete) && !Tok.isAtStartOfLine() &&
+        !existingArrowLoc.isValid()) {
+      if (CodeCompletion)
+        CodeCompletion->completeEffectsSpecifier(asyncLoc.isValid(),
+                                                 throwsLoc.isValid());
+      consumeToken(tok::code_complete);
+      status.setHasCodeCompletionAndIsError();
+      continue;
+    }
+
+    break;
   }
-
-  if (Tok.isAny(tok::kw_throws, tok::kw_throw, tok::kw_try) ||
-      (rethrows && Tok.is(tok::kw_rethrows))) {
-    // If we allowed parsing rethrows, record whether we did in fact parse it.
-    if (rethrows)
-      *rethrows = Tok.is(tok::kw_rethrows);
-
-    // Replace 'throw' or 'try' with 'throws'.
-    if (Tok.isAny(tok::kw_throw, tok::kw_try)) {
-      diagnose(Tok, diag::throw_in_function_type)
-        .fixItReplace(Tok.getLoc(), "throws");
-    }
-
-    StringRef keyword = Tok.getText();
-    throwsLoc = consumeToken();
-
-    if (existingArrowLoc.isValid()) {
-      diagnose(throwsLoc, diag::async_or_throws_in_wrong_position,
-               rethrows ? (*rethrows ? 1 : 0) : 0)
-        .fixItRemove(throwsLoc)
-        .fixItInsert(existingArrowLoc, (keyword + " ").str());
-    }
-
-    if (shouldParseExperimentalConcurrency() &&
-        Tok.isContextualKeyword("async")) {
-      asyncLoc = consumeToken();
-
-      diagnose(asyncLoc, diag::async_after_throws, rethrows && *rethrows)
-        .fixItRemove(asyncLoc)
-        .fixItInsert(
-          existingArrowLoc.isValid() ? existingArrowLoc : throwsLoc, "async ");
-    }
-  }
+  return status;
 }
 
 /// Parse a pattern with an optional type annotation.
@@ -975,7 +1042,7 @@ ParserResult<Pattern> Parser::parsePattern() {
   case tok::identifier: {
     PatternCtx.setCreateSyntax(SyntaxKind::IdentifierPattern);
     Identifier name;
-    SourceLoc loc = consumeIdentifier(&name);
+    SourceLoc loc = consumeIdentifier(name, /*diagnoseDollarPrefix=*/true);
     if (Tok.isIdentifierOrUnderscore() && !Tok.isContextualDeclKeyword())
       diagnoseConsecutiveIDs(name.str(), loc,
                              introducer == VarDecl::Introducer::Let
@@ -1054,7 +1121,7 @@ Parser::parsePatternTupleElement() {
 
   // If the tuple element has a label, parse it.
   if (Tok.is(tok::identifier) && peekToken().is(tok::colon)) {
-    LabelLoc = consumeIdentifier(&Label);
+    LabelLoc = consumeIdentifier(Label, /*diagnoseDollarPrefix=*/true);
     consumeToken(tok::colon);
   }
 

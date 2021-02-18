@@ -207,20 +207,20 @@ SILValue EscapeAnalysis::getPointerRoot(SILValue value) {
   return value;
 }
 
-static bool isNonWritableMemoryAddress(SILNode *V) {
+static bool isNonWritableMemoryAddress(SILValue V) {
   switch (V->getKind()) {
-  case SILNodeKind::FunctionRefInst:
-  case SILNodeKind::DynamicFunctionRefInst:
-  case SILNodeKind::PreviousDynamicFunctionRefInst:
-  case SILNodeKind::WitnessMethodInst:
-  case SILNodeKind::ClassMethodInst:
-  case SILNodeKind::SuperMethodInst:
-  case SILNodeKind::ObjCMethodInst:
-  case SILNodeKind::ObjCSuperMethodInst:
-  case SILNodeKind::StringLiteralInst:
-  case SILNodeKind::ThinToThickFunctionInst:
-  case SILNodeKind::ThinFunctionToPointerInst:
-  case SILNodeKind::PointerToThinFunctionInst:
+  case ValueKind::FunctionRefInst:
+  case ValueKind::DynamicFunctionRefInst:
+  case ValueKind::PreviousDynamicFunctionRefInst:
+  case ValueKind::WitnessMethodInst:
+  case ValueKind::ClassMethodInst:
+  case ValueKind::SuperMethodInst:
+  case ValueKind::ObjCMethodInst:
+  case ValueKind::ObjCSuperMethodInst:
+  case ValueKind::StringLiteralInst:
+  case ValueKind::ThinToThickFunctionInst:
+  case ValueKind::ThinFunctionToPointerInst:
+  case ValueKind::PointerToThinFunctionInst:
     // These instructions return pointers to memory which can't be a
     // destination of a store.
     return true;
@@ -450,6 +450,9 @@ EscapeAnalysis::ConnectionGraph::getNode(SILValue V) {
   if (Node) {
     CGNode *targetNode = Node->getMergeTarget();
     targetNode->mergeFlags(false /*isInterior*/, hasReferenceOnly);
+    // Update the node in Values2Nodes, so that next time we don't need to find
+    // the final merge target.
+    Node = targetNode;
     return targetNode;
   }
   if (isa<SILFunctionArgument>(ptrBase)) {
@@ -768,7 +771,8 @@ void EscapeAnalysis::ConnectionGraph::mergeAllScheduledNodes() {
     if (From->mappedValue) {
       // values previously mapped to 'From' but not transferred to 'To's
       // mappedValue must remain mapped to 'From'. Lookups on those values will
-      // find 'To' via the mergeTarget. Dropping a value's mapping is illegal
+      // find 'To' via the mergeTarget and will remap those values to 'To'
+      // on-the-fly for efficiency. Dropping a value's mapping is illegal
       // because it could cause a node to be recreated without the edges that
       // have already been discovered.
       if (!To->mappedValue) {
@@ -866,6 +870,7 @@ void EscapeAnalysis::ConnectionGraph::computeUsePoints() {
 #include "swift/AST/ReferenceStorage.def"
         case SILInstructionKind::StrongReleaseInst:
         case SILInstructionKind::ReleaseValueInst:
+        case SILInstructionKind::DestroyValueInst:
         case SILInstructionKind::ApplyInst:
         case SILInstructionKind::TryApplyInst: {
           /// Actually we only add instructions which may release a reference.
@@ -1548,8 +1553,8 @@ void EscapeAnalysis::ConnectionGraph::print(llvm::raw_ostream &OS) const {
         const char *Separator = "";
         for (unsigned VIdx = Nd->UsePoints.find_first(); VIdx != -1u;
              VIdx = Nd->UsePoints.find_next(VIdx)) {
-          auto node = UsePointTable[VIdx];
-          OS << Separator << '%' << InstToIDMap[node];
+          SILInstruction *inst = UsePointTable[VIdx];
+          OS << Separator << '%' << InstToIDMap[inst->asSILNode()];
           Separator = ",";
         }
         break;
@@ -1614,11 +1619,13 @@ void EscapeAnalysis::ConnectionGraph::verify() const {
   // Verify that all pointer nodes are still mapped, otherwise the process of
   // merging nodes may have lost information. Only visit reachable blocks,
   // because the graph builder only mapped values from reachable blocks.
-  ReachableBlocks reachable;
-  reachable.visit(F, [this](SILBasicBlock *bb) {
+  ReachableBlocks reachable(F);
+  reachable.visit([this](SILBasicBlock *bb) {
     for (auto &i : *bb) {
-      if (isNonWritableMemoryAddress(&i))
-        continue;
+      if (auto *svi = dyn_cast<SingleValueInstruction>(&i)) {
+        if (isNonWritableMemoryAddress(svi))
+          continue;
+      }
 
       if (auto ai = dyn_cast<ApplyInst>(&i)) {
         if (EA->canOptimizeArrayUninitializedCall(ai).isValid())
@@ -1743,8 +1750,8 @@ void EscapeAnalysis::buildConnectionGraph(FunctionInfo *FInfo,
   assert(ConGraph->isEmpty());
 
   // Visit the blocks in dominance order.
-  ReachableBlocks reachable;
-  reachable.visit(ConGraph->F, [&](SILBasicBlock *bb) {
+  ReachableBlocks reachable(ConGraph->F);
+  reachable.visit([&](SILBasicBlock *bb) {
     // Create edges for the instructions.
     for (auto &i : *bb) {
       analyzeInstruction(&i, FInfo, BottomUpOrder, RecursionDepth);
@@ -2055,15 +2062,15 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
   if (auto *SVI = dyn_cast<SingleValueInstruction>(I)) {
     if (getPointerBase(SVI))
       return;
+
+    // Instructions which return the address of non-writable memory cannot have
+    // an effect on escaping.
+    if (isNonWritableMemoryAddress(SVI))
+      return;
   }
 
   // Incidental uses produce no values and have no effect on their operands.
   if (isIncidentalUse(I))
-    return;
-
-  // Instructions which return the address of non-writable memory cannot have
-  // an effect on escaping.
-  if (isNonWritableMemoryAddress(I))
     return;
 
   switch (I->getKind()) {
@@ -2585,8 +2592,9 @@ bool EscapeAnalysis::canEscapeToUsePoint(SILValue value,
                                          SILInstruction *usePoint,
                                          ConnectionGraph *conGraph) {
 
-  assert((FullApplySite::isa(usePoint) || isa<RefCountingInst>(usePoint))
-         && "use points are only created for calls and refcount instructions");
+  assert((FullApplySite::isa(usePoint) || isa<RefCountingInst>(usePoint) ||
+          isa<DestroyValueInst>(usePoint)) &&
+         "use points are only created for calls and refcount instructions");
 
   CGNode *node = conGraph->getValueContent(value);
   if (!node)
@@ -2643,6 +2651,14 @@ bool EscapeAnalysis::canEscapeTo(SILValue V, RefCountingInst *RI) {
     return true;
   auto *ConGraph = getConnectionGraph(RI->getFunction());
   return canEscapeToUsePoint(V, RI, ConGraph);
+}
+
+bool EscapeAnalysis::canEscapeTo(SILValue V, DestroyValueInst *DVI) {
+  // If it's not uniquely identified we don't know anything about the value.
+  if (!isUniquelyIdentified(V))
+    return true;
+  auto *ConGraph = getConnectionGraph(DVI->getFunction());
+  return canEscapeToUsePoint(V, DVI, ConGraph);
 }
 
 /// Utility to get the function which contains both values \p V1 and \p V2.

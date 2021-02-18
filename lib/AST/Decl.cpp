@@ -45,6 +45,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeLoc.h"
 #include "swift/AST/SwiftNameTranslation.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Parse/Lexer.h" // FIXME: Bad dependency
 #include "clang/Lex/MacroInfo.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -654,7 +655,9 @@ static_assert(sizeof(checkSourceLocType(&ID##Decl::getLoc)) == 2, \
   // When the decl is context-free, we should get loc from source buffer.
   if (!getDeclContext())
     return getLocFromSource();
-  auto *File = cast<FileUnit>(getDeclContext()->getModuleScopeContext());
+  FileUnit *File = dyn_cast<FileUnit>(getDeclContext()->getModuleScopeContext());
+  if (!File)
+    return getLocFromSource();
   switch(File->getKind()) {
   case FileUnitKind::Source:
     return getLocFromSource();
@@ -2401,10 +2404,6 @@ bool swift::conflicting(const OverloadSignature& sig1,
              (sig2.IsVariable && !sig1.Name.getArgumentNames().empty()));
   }
 
-  // If one is asynchronous and the other is not, they can't conflict.
-  if (sig1.HasAsync != sig2.HasAsync)
-    return false;
-
   // Note that we intentionally ignore the HasOpaqueReturnType bit here.
   // For declarations that can't be overloaded by type, we want them to be
   // considered conflicting independent of their type.
@@ -2543,6 +2542,7 @@ mapSignatureExtInfo(AnyFunctionType::ExtInfo info,
     return AnyFunctionType::ExtInfo();
   return AnyFunctionType::ExtInfoBuilder()
       .withRepresentation(info.getRepresentation())
+      .withConcurrent(info.isConcurrent())
       .withAsync(info.isAsync())
       .withThrows(info.isThrowing())
       .withClangFunctionType(info.getClangTypeInfo().getType())
@@ -2628,8 +2628,6 @@ OverloadSignature ValueDecl::getOverloadSignature() const {
   signature.IsTypeAlias = isa<TypeAliasDecl>(this);
   signature.HasOpaqueReturnType =
                        !signature.IsVariable && (bool)getOpaqueResultTypeDecl();
-  signature.HasAsync = isa<AbstractFunctionDecl>(this) &&
-    cast<AbstractFunctionDecl>(this)->hasAsync();
 
   // Unary operators also include prefix/postfix.
   if (auto func = dyn_cast<FuncDecl>(this)) {
@@ -3300,7 +3298,7 @@ getAccessScopeForFormalAccess(const ValueDecl *VD,
     return AccessScope(resultDC->getParentModule());
   case AccessLevel::Public:
   case AccessLevel::Open:
-    return AccessScope::getPublic(VD->isSPI());
+    return AccessScope::getPublic();
   }
 
   llvm_unreachable("unknown access level");
@@ -3417,6 +3415,23 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
     return true;
   }
   llvm_unreachable("bad access level");
+}
+
+bool ValueDecl::isMoreVisibleThan(ValueDecl *other) const {
+  auto scope = getFormalAccessScope();
+
+  // 'other' may have come from a @testable import, so we need to upgrade it's
+  // visibility to public here. That is not the same as whether 'other' is
+  // being built with -enable-testing though -- we don't want to treat it
+  // differently in that case.
+  auto otherScope = other->getFormalAccessScope(getDeclContext());
+
+  if (scope.isPublic())
+    return !otherScope.isPublic();
+  else if (scope.isInternal())
+    return !otherScope.isPublic() && !otherScope.isInternal();
+  else
+    return false;
 }
 
 bool ValueDecl::isAccessibleFrom(const DeclContext *useDC,
@@ -4095,7 +4110,8 @@ VarDecl *NominalTypeDecl::getGlobalActorInstance() const {
 
 ClassDecl::ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
                      ArrayRef<TypeLoc> Inherited,
-                     GenericParamList *GenericParams, DeclContext *Parent)
+                     GenericParamList *GenericParams, DeclContext *Parent,
+                     bool isActor)
   : NominalTypeDecl(DeclKind::Class, Parent, Name, NameLoc, Inherited,
                     GenericParams),
     ClassLoc(ClassLoc) {
@@ -4107,6 +4123,7 @@ ClassDecl::ClassDecl(SourceLoc ClassLoc, Identifier Name, SourceLoc NameLoc,
   Bits.ClassDecl.HasMissingVTableEntries = 0;
   Bits.ClassDecl.ComputedHasMissingVTableEntries = 0;
   Bits.ClassDecl.IsIncompatibleWithWeakReferences = 0;
+  Bits.ClassDecl.IsActor = isActor;
 }
 
 bool ClassDecl::hasResilientMetadata() const {
@@ -4185,6 +4202,13 @@ bool ClassDecl::isActor() const {
                            false);
 }
 
+bool ClassDecl::isDefaultActor() const {
+  auto mutableThis = const_cast<ClassDecl *>(this);
+  return evaluateOrDefault(getASTContext().evaluator,
+                           IsDefaultActorRequest{mutableThis},
+                           false);
+}
+
 bool ClassDecl::hasMissingDesignatedInitializers() const {
   return evaluateOrDefault(
       getASTContext().evaluator,
@@ -4234,6 +4258,7 @@ ClassAncestryFlagsRequest::evaluate(Evaluator &evaluator,
                                     ClassDecl *value) const {
   AncestryOptions result;
   const ClassDecl *CD = value;
+  const ClassDecl *PreviousCD = nullptr;
   auto *M = value->getParentModule();
 
   do {
@@ -4248,8 +4273,16 @@ ClassAncestryFlagsRequest::evaluate(Evaluator &evaluator,
     if (CD->getAttrs().hasAttribute<ObjCMembersAttr>())
       result |= AncestryFlags::ObjCMembers;
 
-    if (CD->hasClangNode())
+    if (CD->hasClangNode()) {
       result |= AncestryFlags::ClangImported;
+
+      // Inheriting from an ObjC-defined class generally forces the use
+      // of the ObjC object model, but certain classes that directly
+      // inherit from NSObject can change that.
+      if (!PreviousCD ||
+          !(CD->isNSObject() && PreviousCD->isNativeNSObjectSubclass()))
+        result |= AncestryFlags::ObjCObjectModel;
+    }
 
     if (CD->hasResilientMetadata())
       result |= AncestryFlags::Resilient;
@@ -4260,6 +4293,7 @@ ClassAncestryFlagsRequest::evaluate(Evaluator &evaluator,
     if (CD->getAttrs().hasAttribute<RequiresStoredPropertyInitsAttr>())
       result |= AncestryFlags::RequiresStoredPropertyInits;
 
+    PreviousCD = CD;
     CD = CD->getSuperclassDecl();
   } while (CD != nullptr);
 
@@ -4586,6 +4620,10 @@ ProtocolDecl::ProtocolDecl(DeclContext *DC, SourceLoc ProtocolLoc,
     setTrailingWhereClause(TrailingWhere);
 }
 
+bool ProtocolDecl::isMarkerProtocol() const {
+  return getAttrs().hasAttribute<MarkerAttr>();
+}
+
 ArrayRef<ProtocolDecl *> ProtocolDecl::getInheritedProtocols() const {
   auto *mutThis = const_cast<ProtocolDecl *>(this);
   return evaluateOrDefault(getASTContext().evaluator,
@@ -4795,12 +4833,26 @@ findProtocolSelfReferences(const ProtocolDecl *proto, Type type,
     return findProtocolSelfReferences(proto, selfType->getSelfType(), position);
   }
 
-  // Bound generic types are invariant.
-  if (auto boundGenericType = type->getAs<BoundGenericType>()) {
+  // Most bound generic types are invariant.
+  if (auto *const bgt = type->getAs<BoundGenericType>()) {
     auto info = SelfReferenceInfo();
-    for (auto paramType : boundGenericType->getGenericArgs()) {
-      info |= findProtocolSelfReferences(proto, paramType,
+
+    const auto &ctx = bgt->getDecl()->getASTContext();
+    if (ctx.getArrayDecl() == bgt->getDecl()) {
+      // Swift.Array preserves variance in its Value type.
+      info |= findProtocolSelfReferences(proto, bgt->getGenericArgs().front(),
+                                         position);
+    } else if (bgt->getDecl() == ctx.getDictionaryDecl()) {
+      // Swift.Dictionary preserves variance in its Element type.
+      info |= findProtocolSelfReferences(proto, bgt->getGenericArgs().front(),
                                          SelfReferencePosition::Invariant);
+      info |= findProtocolSelfReferences(proto, bgt->getGenericArgs().back(),
+                                         position);
+    } else {
+      for (auto paramType : bgt->getGenericArgs()) {
+        info |= findProtocolSelfReferences(proto, paramType,
+                                           SelfReferencePosition::Invariant);
+      }
     }
 
     return info;
@@ -5897,11 +5949,18 @@ void VarDecl::visitAuxiliaryDecls(llvm::function_ref<void(VarDecl *)> visit) con
   if (getDeclContext()->isTypeContext())
     return;
 
-  if (auto *backingVar = getPropertyWrapperBackingProperty())
-    visit(backingVar);
+  if (getAttrs().hasAttribute<LazyAttr>()) {
+    if (auto *backingVar = getLazyStorageProperty())
+      visit(backingVar);
+  }
 
-  if (auto *projectionVar = getPropertyWrapperProjectionVar())
-    visit(projectionVar);
+  if (getAttrs().hasAttribute<CustomAttr>()) {
+    if (auto *backingVar = getPropertyWrapperBackingProperty())
+      visit(backingVar);
+
+    if (auto *projectionVar = getPropertyWrapperProjectionVar())
+      visit(projectionVar);
+  }
 }
 
 VarDecl *VarDecl::getLazyStorageProperty() const {
@@ -6062,6 +6121,9 @@ ParamDecl *ParamDecl::cloneWithoutType(const ASTContext &Ctx, ParamDecl *PD) {
 
   Clone->setSpecifier(PD->getSpecifier());
   Clone->setImplicitlyUnwrappedOptional(PD->isImplicitlyUnwrappedOptional());
+  if (PD->isImplicit()) {
+    Clone->setImplicit();
+  }
   return Clone;
 }
 
@@ -6728,6 +6790,10 @@ bool AbstractFunctionDecl::argumentNameIsAPIByDefault() const {
   return false;
 }
 
+bool AbstractFunctionDecl::isConcurrent() const {
+  return getAttrs().hasAttribute<ConcurrentAttr>();
+}
+
 bool AbstractFunctionDecl::isAsyncHandler() const {
   auto func = dyn_cast<FuncDecl>(this);
   if (!func)
@@ -6956,7 +7022,7 @@ AbstractFunctionDecl::getObjCSelector(DeclName preferredName,
     }
 
     // For the first selector piece, attach either the first parameter,
-    // "withCompletionHandker", or "AndReturnError" to the base name,
+    // "withCompletionHandler", or "AndReturnError" to the base name,
     // if appropriate.
     auto firstPiece = baseName;
     llvm::SmallString<32> scratch;
@@ -7524,6 +7590,20 @@ ConstructorDecl::ConstructorDecl(DeclName Name, SourceLoc ConstructorLoc,
   assert(Name.getBaseName() == DeclBaseName::createConstructor());
 }
 
+ConstructorDecl *ConstructorDecl::createImported(
+    ASTContext &ctx, ClangNode clangNode, DeclName name,
+    SourceLoc constructorLoc, bool failable, SourceLoc failabilityLoc,
+    bool throws, SourceLoc throwsLoc, ParameterList *bodyParams,
+    GenericParamList *genericParams, DeclContext *parent) {
+  void *declPtr = allocateMemoryForDecl<ConstructorDecl>(
+      ctx, sizeof(ConstructorDecl), true);
+  auto ctor = ::new (declPtr)
+      ConstructorDecl(name, constructorLoc, failable, failabilityLoc, throws,
+                      throwsLoc, bodyParams, genericParams, parent);
+  ctor->setClangNode(clangNode);
+  return ctor;
+}
+
 bool ConstructorDecl::isObjCZeroParameterWithLongSelector() const {
   // The initializer must have a single, non-empty argument name.
   if (getName().getArgumentNames().size() != 1 ||
@@ -7868,7 +7948,7 @@ Type TypeBase::getSwiftNewtypeUnderlyingType() {
 
   // Make sure the clang node has swift_newtype attribute
   auto clangNode = structDecl->getClangDecl();
-  if (!clangNode || !clangNode->hasAttr<clang::SwiftNewtypeAttr>())
+  if (!clangNode || !clangNode->hasAttr<clang::SwiftNewTypeAttr>())
     return {};
 
   // Underlying type is the type of rawValue
@@ -7878,6 +7958,46 @@ Type TypeBase::getSwiftNewtypeUnderlyingType() {
         return varDecl->getType();
 
   return {};
+}
+
+bool ClassDecl::hasExplicitCustomActorMethods() const {
+  auto &ctx = getASTContext();
+  for (auto member: getMembers()) {
+    if (member->isImplicit()) continue;
+
+    // Methods called enqueue(partialTask:)
+    if (auto func = dyn_cast<FuncDecl>(member)) {
+      if (FuncDecl::isEnqueuePartialTaskName(ctx, func->getName()))
+        return true;
+    }
+  }
+
+  return false;
+}
+
+bool ClassDecl::isRootDefaultActor() const {
+  if (!isDefaultActor()) return false;
+  auto superclass = getSuperclassDecl();
+  return (!superclass || superclass->isNSObject());
+}
+
+bool ClassDecl::isNativeNSObjectSubclass() const {
+  // Only if we inherit from NSObject.
+  auto superclass = getSuperclassDecl();
+  if (!superclass || !superclass->isNSObject())
+    return false;
+
+  // For now, only actors (regardless of whether they're default actors).
+  // Eventually we should roll this out to more classes, but we have to
+  // do it with ABI compatibility.
+  return isActor();
+}
+
+bool ClassDecl::isNSObject() const {
+  if (!getName().is("NSObject")) return false;
+  ASTContext &ctx = getASTContext();
+  return (getModuleContext()->getName() == ctx.Id_Foundation ||
+          getModuleContext()->getName() == ctx.Id_ObjectiveC);
 }
 
 Type ClassDecl::getSuperclass() const {
@@ -7901,6 +8021,45 @@ void ClassDecl::setSuperclass(Type superclass) {
   LazySemanticInfo.SuperclassDecl.setPointerAndInt(
     superclass ? superclass->getClassOrBoundGenericClass() : nullptr,
     true);
+}
+
+ActorIsolation swift::getActorIsolation(ValueDecl *value) {
+  auto &ctx = value->getASTContext();
+  return evaluateOrDefault(
+      ctx.evaluator, ActorIsolationRequest{value},
+      ActorIsolation::forUnspecified());
+}
+
+ActorIsolation swift::getActorIsolationOfContext(DeclContext *dc) {
+  if (auto *vd = dyn_cast_or_null<ValueDecl>(dc->getAsDecl()))
+    return getActorIsolation(vd);
+
+  if (auto *init = dyn_cast<PatternBindingInitializer>(dc)) {
+    if (auto *var = init->getBinding()->getAnchoringVarDecl(
+            init->getBindingIndex()))
+      return getActorIsolation(var);
+  }
+
+  if (auto *closure = dyn_cast<AbstractClosureExpr>(dc)) {
+    switch (auto isolation = closure->getActorIsolation()) {
+    case ClosureActorIsolation::Independent:
+      return ActorIsolation::forIndependent(ActorIndependentKind::Safe);
+
+    case ClosureActorIsolation::GlobalActor: {
+      return ActorIsolation::forGlobalActor(isolation.getGlobalActor());
+    }
+
+    case ClosureActorIsolation::ActorInstance: {
+      auto selfDecl = isolation.getActorInstance();
+      auto actorClass = selfDecl->getType()->getRValueType()
+          ->getClassOrBoundGenericClass();
+      assert(actorClass && "Bad closure actor isolation?");
+      return ActorIsolation::forActorInstance(actorClass);
+    }
+    }
+  }
+
+  return ActorIsolation::forUnspecified();
 }
 
 ClangNode Decl::getClangNodeImpl() const {

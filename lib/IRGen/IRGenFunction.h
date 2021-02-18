@@ -83,13 +83,16 @@ public:
                 OptimizationMode Mode = OptimizationMode::NotSet,
                 const SILDebugScope *DbgScope = nullptr,
                 Optional<SILLocation> DbgLoc = None);
-  virtual ~IRGenFunction();
+  ~IRGenFunction();
 
   void unimplemented(SourceLoc Loc, StringRef Message);
 
   friend class Scope;
 
-//--- Function prologue and epilogue -------------------------------------------
+  Address createErrorResultSlot(SILType errorType, bool isAsync);
+
+  //--- Function prologue and epilogue
+  //-------------------------------------------
 public:
   Explosion collectParameters();
   void emitScalarReturn(SILType returnResultType, SILType funcResultType,
@@ -106,6 +109,7 @@ public:
   /// For async functions, this is different from the caller result slot because
   /// that is a gep into the %swift.context.
   Address getCalleeErrorResultSlot(SILType errorType);
+  Address getAsyncCalleeErrorResultSlot(SILType errorType);
 
   /// Return the error result slot provided by the caller.
   Address getCallerErrorResultSlot();
@@ -128,9 +132,35 @@ public:
     CoroutineHandle = handle;
   }
 
-  virtual llvm::Value *getAsyncTask();
-  virtual llvm::Value *getAsyncExecutor();
-  virtual llvm::Value *getAsyncContext();
+  llvm::Value *getAsyncTask();
+  llvm::Value *getAsyncExecutor();
+  llvm::Value *getAsyncContext();
+
+  llvm::CallInst *emitSuspendAsyncCall(ArrayRef<llvm::Value *> args);
+
+  llvm::Function *getOrCreateResumePrjFn();
+  llvm::Function *createAsyncDispatchFn(const FunctionPointer &fnPtr,
+                                        ArrayRef<llvm::Value *> args);
+  llvm::Function *createAsyncDispatchFn(const FunctionPointer &fnPtr,
+                                        ArrayRef<llvm::Type *> argTypes);
+
+  void emitGetAsyncContinuation(SILType resumeTy,
+                                StackAddress optionalResultAddr,
+                                Explosion &out);
+
+  void emitAwaitAsyncContinuation(SILType resumeTy,
+                                  bool isIndirectResult,
+                                  Explosion &outDirectResult,
+                                  llvm::BasicBlock *&normalBB,
+                                  llvm::PHINode *&optionalErrorPhi,
+                                  llvm::BasicBlock *&optionalErrorBB);
+
+  FunctionPointer
+  getFunctionPointerForResumeIntrinsic(llvm::Value *resumeIntrinsic);
+
+  void emitSuspensionPoint(llvm::Value *toExecutor, llvm::Value *asyncResume);
+  llvm::Function *getOrCreateResumeFromSuspensionFn();
+  llvm::Function *createAsyncSuspendFn();
 
 private:
   void emitPrologue();
@@ -139,9 +169,21 @@ private:
   Address ReturnSlot;
   llvm::BasicBlock *ReturnBB;
   llvm::Value *CalleeErrorResultSlot = nullptr;
+  llvm::Value *AsyncCalleeErrorResultSlot = nullptr;
   llvm::Value *CallerErrorResultSlot = nullptr;
   llvm::Value *CoroutineHandle = nullptr;
-  bool IsAsync = false;
+  llvm::Value *AsyncCoroutineCurrentResume = nullptr;
+  llvm::Value *AsyncCoroutineCurrentContinuationContext = nullptr;
+
+  Address asyncTaskLocation;
+  Address asyncExecutorLocation;
+  Address asyncContextLocation;
+
+  /// The unique block that calls @llvm.coro.end.
+  llvm::BasicBlock *CoroutineExitBlock = nullptr;
+
+public:
+  void emitCoroutineOrAsyncExit();
 
 //--- Helper methods -----------------------------------------------------------
 public:
@@ -155,8 +197,8 @@ public:
     return getEffectiveOptimizationMode() == OptimizationMode::ForSize;
   }
 
-  bool isAsync() const { return IsAsync; }
-  void setAsync(bool async = true) { IsAsync = async; }
+  void setupAsync();
+  bool isAsync() const { return asyncTaskLocation.isValid(); }
 
   Address createAlloca(llvm::Type *ty, Alignment align,
                        const llvm::Twine &name = "");
@@ -206,7 +248,9 @@ public:
   emitLoadOfRelativeIndirectablePointer(Address addr, bool isFar,
                                         llvm::PointerType *expectedType,
                                         const llvm::Twine &name = "");
-
+  llvm::Value *emitLoadOfRelativePointer(Address addr, bool isFar,
+                                         llvm::PointerType *expectedType,
+                                         const llvm::Twine &name = "");
 
   llvm::Value *emitAllocObjectCall(llvm::Value *metadata, llvm::Value *size,
                                    llvm::Value *alignMask,
@@ -449,6 +493,12 @@ public:
 
   llvm::Value *emitIsEscapingClosureCall(llvm::Value *value, SourceLoc loc,
                                          unsigned verificationType);
+
+  Address emitTaskAlloc(llvm::Value *size,
+                        Alignment alignment);
+  void emitTaskDealloc(Address address);
+
+  llvm::Value *alignUpToMaximumAlignment(llvm::Type *sizeTy, llvm::Value *val);
 
   //--- Expression emission
   //------------------------------------------------------

@@ -2,6 +2,7 @@ target_sources(swiftSILOptimizer PRIVATE
   AccessEnforcementSelection.cpp
   AccessMarkerElimination.cpp
   AddressLowering.cpp
+  CapturePromotion.cpp
   ClosureLifetimeFixup.cpp
   ConstantPropagation.cpp
   DefiniteInitialization.cpp
@@ -9,6 +10,7 @@ target_sources(swiftSILOptimizer PRIVATE
   DataflowDiagnostics.cpp
   DiagnoseInfiniteRecursion.cpp
   DiagnoseInvalidEscapingCaptures.cpp
+  DiagnoseLifetimeIssues.cpp
   DiagnoseStaticExclusivity.cpp
   DiagnoseUnreachable.cpp
   DiagnoseVarUsage.cpp
@@ -17,6 +19,7 @@ target_sources(swiftSILOptimizer PRIVATE
   IRGenPrepare.cpp
   MandatoryInlining.cpp
   NestedSemanticFunctionCheck.cpp
+  OptimizeHopToExecutor.cpp
   PredictableMemOpt.cpp
   PMOMemoryUseCollector.cpp
   RawSILInstLowering.cpp

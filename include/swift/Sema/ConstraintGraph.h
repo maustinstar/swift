@@ -72,6 +72,12 @@ public:
   ArrayRef<TypeVariableType *> getEquivalenceClass() const;
 
 private:
+  /// Determines whether the type variable associated with this node
+  /// is a representative of an equivalence class.
+  ///
+  /// Note: The smallest equivalence class is of just one variable - itself.
+  bool forRepresentativeVar() const;
+
   /// Retrieve all of the type variables in the same equivalence class
   /// as this type variable.
   ArrayRef<TypeVariableType *> getEquivalenceClassUnsafe() const;
@@ -228,14 +234,13 @@ public:
     /// The constraints in this component.
     TinyPtrVector<Constraint *> constraints;
 
-  public:
     /// The set of components that this component depends on, such that
     /// the partial solutions of the those components need to be available
     /// before this component can be solved.
     ///
-    /// FIXME: Use a TinyPtrVector here.
-    std::vector<unsigned> dependsOn;
+    SmallVector<unsigned, 2> dependencies;
 
+  public:
     Component(unsigned solutionIndex) : solutionIndex(solutionIndex) { }
 
     /// Whether this component represents an orphaned constraint.
@@ -249,6 +254,11 @@ public:
     const TinyPtrVector<Constraint *> &getConstraints() const {
       return constraints;
     }
+
+    /// Records a component which this component depends on.
+    void recordDependency(const Component &component);
+
+    ArrayRef<unsigned> getDependencies() const { return dependencies; }
 
     unsigned getNumDisjunctions() const { return numDisjunctions; }
   };

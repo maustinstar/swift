@@ -362,8 +362,6 @@ public:
   std::string getModuleOutputPathForAtMostOnePrimary() const;
   std::string
   getReferenceDependenciesFilePathForPrimary(StringRef filename) const;
-  std::string getSwiftRangesFilePathForPrimary(StringRef filename) const;
-  std::string getCompiledSourceFilePathForPrimary(StringRef filename) const;
   std::string getSerializedDiagnosticsPathForAtMostOnePrimary() const;
 
   /// TBDPath only makes sense in whole module compilation mode,
@@ -416,6 +414,10 @@ class CompilerInstance {
   std::unique_ptr<Lowering::TypeConverter> TheSILTypes;
   std::unique_ptr<DiagnosticVerifier> DiagVerifier;
 
+  /// A cache describing the set of inter-module dependencies that have been queried.
+  /// Null if not present.
+  std::unique_ptr<ModuleDependenciesCache> ModDepCache;
+
   /// Null if no tracker.
   std::unique_ptr<DependencyTracker> DepTracker;
   /// If there is no stats output directory by the time the
@@ -465,7 +467,9 @@ public:
   DiagnosticEngine &getDiags() { return Diagnostics; }
   const DiagnosticEngine &getDiags() const { return Diagnostics; }
 
-  llvm::vfs::FileSystem &getFileSystem() { return *SourceMgr.getFileSystem(); }
+  llvm::vfs::FileSystem &getFileSystem() const {
+    return *SourceMgr.getFileSystem();
+  }
 
   ASTContext &getASTContext() { return *Context; }
   const ASTContext &getASTContext() const { return *Context; }
@@ -556,8 +560,11 @@ private:
   bool setUpInputs();
   bool setUpASTContextIfNeeded();
   void setupStatsReporter();
-  void setupDiagnosticVerifierIfNeeded();
   void setupDependencyTrackerIfNeeded();
+
+  /// \return false if successsful, true on error.
+  bool setupDiagnosticVerifierIfNeeded();
+
   Optional<unsigned> setUpCodeCompletionBuffer();
 
   /// Find a buffer for a given input file and ensure it is recorded in
@@ -565,7 +572,9 @@ private:
   /// Return the buffer ID if it is not already compiled, or None if so.
   /// Set failed on failure.
 
-  Optional<unsigned> getRecordedBufferID(const InputFile &input, bool &failed);
+  Optional<unsigned> getRecordedBufferID(const InputFile &input,
+                                         const bool shouldRecover,
+                                         bool &failed);
 
   /// Given an input file, return a buffer to use for its contents,
   /// and a buffer for the corresponding module doc file if one exists.
@@ -645,16 +654,6 @@ public:
   getPrimarySpecificPathsForAtMostOnePrimary() const;
   const PrimarySpecificPaths &
   getPrimarySpecificPathsForSourceFile(const SourceFile &SF) const;
-
-  /// Write out the unparsed (delayed) source ranges
-  /// Return true for error
-  bool emitSwiftRanges(DiagnosticEngine &diags, SourceFile *primaryFile,
-                       StringRef outputPath) const;
-
-  /// Return true for error
-  bool emitCompiledSource(DiagnosticEngine &diags,
-                          const SourceFile *primaryFile,
-                          StringRef outputPath) const;
 };
 
 } // namespace swift

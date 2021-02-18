@@ -211,20 +211,29 @@ namespace {
 
   struct NominalTypeDescriptorCacheEntry {
   private:
-    std::string Name;
+    const char *Name;
+    size_t NameLength;
     const ContextDescriptor *Description;
 
   public:
     NominalTypeDescriptorCacheEntry(const llvm::StringRef name,
                                     const ContextDescriptor *description)
-      : Name(name.str()), Description(description) {}
-
-    const ContextDescriptor *getDescription() {
-      return Description;
+        : Description(description) {
+      char *nameCopy = reinterpret_cast<char *>(malloc(name.size()));
+      memcpy(nameCopy, name.data(), name.size());
+      Name = nameCopy;
+      NameLength = name.size();
     }
 
-    int compareWithKey(llvm::StringRef aName) const {
-      return aName.compare(Name);
+    const ContextDescriptor *getDescription() const { return Description; }
+
+    bool matchesKey(llvm::StringRef aName) {
+      return aName == llvm::StringRef{Name, NameLength};
+    }
+
+    friend llvm::hash_code
+    hash_value(const NominalTypeDescriptorCacheEntry &value) {
+      return hash_value(llvm::StringRef{value.Name, value.NameLength});
     }
 
     template <class... T>
@@ -235,7 +244,7 @@ namespace {
 } // end anonymous namespace
 
 struct TypeMetadataPrivateState {
-  ConcurrentMap<NominalTypeDescriptorCacheEntry> NominalCache;
+  ConcurrentReadableHashMap<NominalTypeDescriptorCacheEntry> NominalCache;
   ConcurrentReadableArray<TypeMetadataSection> SectionsToScan;
   
   TypeMetadataPrivateState() {
@@ -713,8 +722,11 @@ _findContextDescriptor(Demangle::NodePointer node,
 
   // Look for an existing entry.
   // Find the bucket for the metadata entry.
-  if (auto Value = T.NominalCache.find(mangledName))
-    return Value->getDescription();
+  {
+    auto snapshot = T.NominalCache.snapshot();
+    if (auto Value = snapshot.find(mangledName))
+      return Value->getDescription();
+  }
 
   // Check type metadata records		   
   // Scan any newly loaded images for context descriptors, then try the context
@@ -726,7 +738,13 @@ _findContextDescriptor(Demangle::NodePointer node,
     foundContext = _searchConformancesByMangledTypeName(node);
   
   if (foundContext)
-    T.NominalCache.getOrInsert(mangledName, foundContext);
+    T.NominalCache.getOrInsert(mangledName, [&](NominalTypeDescriptorCacheEntry
+                                                    *entry,
+                                                bool created) {
+      if (created)
+        new (entry) NominalTypeDescriptorCacheEntry{mangledName, foundContext};
+      return true;
+    });
 
   return foundContext;
 }
@@ -746,18 +764,29 @@ namespace {
 
   struct ProtocolDescriptorCacheEntry {
   private:
-    std::string Name;
+    const char *Name;
+    size_t NameLength;
     const ProtocolDescriptor *Description;
 
   public:
     ProtocolDescriptorCacheEntry(const llvm::StringRef name,
                                  const ProtocolDescriptor *description)
-        : Name(name.str()), Description(description) {}
+        : Description(description) {
+      char *nameCopy = reinterpret_cast<char *>(malloc(name.size()));
+      memcpy(nameCopy, name.data(), name.size());
+      Name = nameCopy;
+      NameLength = name.size();
+    }
 
-    const ProtocolDescriptor *getDescription() { return Description; }
+    const ProtocolDescriptor *getDescription() const { return Description; }
 
-    int compareWithKey(llvm::StringRef aName) const {
-      return aName.compare(Name);
+    bool matchesKey(llvm::StringRef aName) {
+      return aName == llvm::StringRef{Name, NameLength};
+    }
+
+    friend llvm::hash_code
+    hash_value(const ProtocolDescriptorCacheEntry &value) {
+      return hash_value(llvm::StringRef{value.Name, value.NameLength});
     }
 
     template <class... T>
@@ -767,7 +796,7 @@ namespace {
   };
 
   struct ProtocolMetadataPrivateState {
-    ConcurrentMap<ProtocolDescriptorCacheEntry> ProtocolCache;
+    ConcurrentReadableHashMap<ProtocolDescriptorCacheEntry> ProtocolCache;
     ConcurrentReadableArray<ProtocolSection> SectionsToScan;
 
     ProtocolMetadataPrivateState() {
@@ -849,14 +878,23 @@ _findProtocolDescriptor(NodePointer node,
 
   // Look for an existing entry.
   // Find the bucket for the metadata entry.
-  if (auto Value = T.ProtocolCache.find(mangledName))
-    return Value->getDescription();
+  {
+    auto snapshot = T.ProtocolCache.snapshot();
+    if (auto Value = snapshot.find(mangledName))
+      return Value->getDescription();
+  }
 
   // Check type metadata records
   foundProtocol = _searchProtocolRecords(T, node);
 
   if (foundProtocol) {
-    T.ProtocolCache.getOrInsert(mangledName, foundProtocol);
+    T.ProtocolCache.getOrInsert(mangledName, [&](ProtocolDescriptorCacheEntry
+                                                     *entry,
+                                                 bool created) {
+      if (created)
+        new (entry) ProtocolDescriptorCacheEntry{mangledName, foundProtocol};
+      return true;
+    });
   }
 
   return foundProtocol;
@@ -1246,6 +1284,10 @@ public:
   using BuiltTypeDecl = const ContextDescriptor *;
   using BuiltProtocolDecl = ProtocolDescriptorRef;
 
+  BuiltType decodeMangledType(NodePointer node) {
+    return Demangle::decodeMangledType(*this, node).getType();
+  }
+
   Demangle::NodeFactory &getNodeFactory() { return demangler; }
 
   TypeLookupErrorOr<BuiltType>
@@ -1425,7 +1467,7 @@ public:
     return BuiltType();
   }
 
-  TypeLookupErrorOr<BuiltType>
+  BuiltType
   createGenericTypeParameterType(unsigned depth, unsigned index) const {
     // Use the callback, when provided.
     if (substGenericParameter)
@@ -1522,6 +1564,67 @@ public:
   TypeLookupErrorOr<BuiltType> createSILBoxType(BuiltType base) const {
     // FIXME: Implement.
     return BuiltType();
+  }
+
+  using BuiltSILBoxField = llvm::PointerIntPair<BuiltType, 1>;
+  using BuiltSubstitution = std::pair<BuiltType, BuiltType>;
+  struct BuiltLayoutConstraint {
+    bool operator==(BuiltLayoutConstraint rhs) const { return true; }
+    operator bool() const { return true; }
+  };
+  using BuiltLayoutConstraint = BuiltLayoutConstraint;
+  BuiltLayoutConstraint getLayoutConstraint(LayoutConstraintKind kind) {
+    return {};
+  }
+  BuiltLayoutConstraint
+  getLayoutConstraintWithSizeAlign(LayoutConstraintKind kind, unsigned size,
+                                   unsigned alignment) {
+    return {};
+  }
+
+#if LLVM_PTR_SIZE == 4
+  /// Unfortunately the alignment of TypeRef is too large to squeeze in 3 extra
+  /// bits on (some?) 32-bit systems.
+  class BigBuiltTypeIntPair {
+    BuiltType Ptr;
+    RequirementKind Int;
+  public:
+    BigBuiltTypeIntPair(BuiltType ptr, RequirementKind i) : Ptr(ptr), Int(i) {}
+    RequirementKind getInt() const { return Int; }
+    BuiltType getPointer() const { return Ptr; }
+    uint64_t getOpaqueValue() const {
+      return (uint64_t)Ptr | ((uint64_t)Int << 32);
+    }
+  };
+#endif
+
+  struct Requirement : public RequirementBase<BuiltType,
+#if LLVM_PTR_SIZE == 4
+         BigBuiltTypeIntPair,
+#else
+         llvm::PointerIntPair<BuiltType, 3, RequirementKind>,
+
+#endif
+         BuiltLayoutConstraint> {
+    Requirement(RequirementKind kind, BuiltType first, BuiltType second)
+        : RequirementBase(kind, first, second) {}
+    Requirement(RequirementKind kind, BuiltType first,
+                BuiltLayoutConstraint second)
+        : RequirementBase(kind, first, second) {}
+  };
+  using BuiltRequirement = Requirement;
+
+  TypeLookupErrorOr<BuiltType> createSILBoxTypeWithLayout(
+      llvm::ArrayRef<BuiltSILBoxField> Fields,
+      llvm::ArrayRef<BuiltSubstitution> Substitutions,
+      llvm::ArrayRef<BuiltRequirement> Requirements) const {
+    // FIXME: Implement.
+    return BuiltType();
+  }
+
+  bool isExistential(BuiltType) {
+    // FIXME: Implement.
+    return true;
   }
 
   TypeReferenceOwnership getReferenceOwnership() const {

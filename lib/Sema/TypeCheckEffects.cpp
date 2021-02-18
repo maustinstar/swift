@@ -19,11 +19,212 @@
 #include "TypeCheckConcurrency.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/DiagnosticsSema.h"
+#include "swift/AST/Effects.h"
 #include "swift/AST/Initializer.h"
+#include "swift/AST/ParameterList.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/TypeCheckRequests.h"
 
 using namespace swift;
+
+static bool hasFunctionParameterWithEffect(EffectKind kind, Type type) {
+  // Look through Optional types.
+  type = type->lookThroughAllOptionalTypes();
+
+  // Only consider function types with this effect.
+  if (auto fnType = type->getAs<AnyFunctionType>()) {
+    auto extInfo = fnType->getExtInfo();
+    switch (kind) {
+    case EffectKind::Throws: return extInfo.isThrowing();
+    case EffectKind::Async: return extInfo.isAsync();
+    }
+    llvm_unreachable("Bad effect kind");
+  }
+
+  // Look through tuples.
+  if (auto tuple = type->getAs<TupleType>()) {
+    for (auto eltType : tuple->getElementTypes()) {
+      if (hasFunctionParameterWithEffect(kind, eltType))
+        return true;
+    }
+    return false;
+  }
+
+  // Suppress diagnostics in the presence of errors.
+  if (type->hasError()) {
+    return true;
+  }
+
+  return false;
+}
+
+PolymorphicEffectRequirementList
+PolymorphicEffectRequirementsRequest::evaluate(Evaluator &evaluator,
+                                               EffectKind kind,
+                                               ProtocolDecl *proto) const {
+  ASTContext &ctx = proto->getASTContext();
+
+  // only allow rethrowing requirements to be determined from marked protocols
+  if (!proto->hasPolymorphicEffect(kind)) {
+    return PolymorphicEffectRequirementList();
+  }
+
+  SmallVector<AbstractFunctionDecl *, 2> requirements;
+  SmallVector<std::pair<Type, ProtocolDecl *>, 2> conformances;
+  
+  // check if immediate members of protocol are 'throws'
+  for (auto member : proto->getMembers()) {
+    auto fnDecl = dyn_cast<AbstractFunctionDecl>(member);
+    if (!fnDecl || !fnDecl->hasEffect(kind))
+      continue;
+
+    requirements.push_back(fnDecl);
+  }
+
+  // check associated conformances of associated types or inheritance
+  for (auto requirement : proto->getRequirementSignature()) {
+    if (requirement.getKind() != RequirementKind::Conformance)
+      continue;
+
+    auto protoTy = requirement.getSecondType()->castTo<ProtocolType>();
+    auto protoDecl = protoTy->getDecl();
+    if (!protoDecl->hasPolymorphicEffect(kind))
+      continue;
+
+    conformances.emplace_back(requirement.getFirstType(), protoDecl);
+  }
+  
+  return PolymorphicEffectRequirementList(ctx.AllocateCopy(requirements),
+                                          ctx.AllocateCopy(conformances));
+}
+
+PolymorphicEffectKind
+PolymorphicEffectKindRequest::evaluate(Evaluator &evaluator,
+                                       EffectKind kind,
+                                       AbstractFunctionDecl *decl) const {
+  if (!decl->hasEffect(kind))
+    return PolymorphicEffectKind::None;
+
+  if (!decl->hasPolymorphicEffect(kind)) {
+    if (auto proto = dyn_cast<ProtocolDecl>(decl->getDeclContext())) {
+      if (proto->hasPolymorphicEffect(kind))
+        return PolymorphicEffectKind::ByConformance;
+    }
+
+    return PolymorphicEffectKind::Always;
+  }
+
+  if (auto genericSig = decl->getGenericSignature()) {
+    for (auto req : genericSig->getRequirements()) {
+      if (req.getKind() == RequirementKind::Conformance) {
+        if (req.getSecondType()->castTo<ProtocolType>()
+                               ->getDecl()
+                               ->hasPolymorphicEffect(kind)) {
+          return PolymorphicEffectKind::ByConformance;
+        }
+      }
+    }
+  }
+
+  for (auto param : *decl->getParameters()) {
+    auto interfaceTy = param->getInterfaceType();
+    if (hasFunctionParameterWithEffect(kind, interfaceTy)) {
+      return PolymorphicEffectKind::ByClosure;
+    }
+  }
+
+  return PolymorphicEffectKind::Invalid;
+}
+
+static bool classifyWitness(ModuleDecl *module, 
+                            ProtocolConformance *conformance, 
+                            AbstractFunctionDecl *req,
+                            EffectKind kind) {
+  auto declRef = conformance->getWitnessDeclRef(req);
+  if (!declRef) {
+    // Invalid conformance.
+    return true;
+  }
+
+  auto witnessDecl = dyn_cast<AbstractFunctionDecl>(declRef.getDecl());
+  if (!witnessDecl) {
+    // Enum element constructors do not have effects.
+    assert(isa<EnumElementDecl>(declRef.getDecl()));
+    return false;
+  }
+
+  switch (witnessDecl->getPolymorphicEffectKind(kind)) {
+    case PolymorphicEffectKind::None:
+      // Witness doesn't have this effect at all, so it contributes nothing.
+      return false;
+
+    case PolymorphicEffectKind::ByConformance: {
+      // Witness has the effect if the concrete type's conformances
+      // recursively have the effect.
+      auto substitutions = conformance->getSubstitutions(module);
+      for (auto conformanceRef : substitutions.getConformances()) {
+        if (conformanceRef.hasEffect(kind)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    case PolymorphicEffectKind::ByClosure:
+      // Witness only has the effect if a closure argument has the effect,
+      // so it contributes nothing to the conformance`s effect.
+      return false;
+
+    case PolymorphicEffectKind::Always:
+      // Witness always has the effect.
+      return true;
+
+    case PolymorphicEffectKind::Invalid:
+      // If something was invalid, just assume it has the effect.
+      return true;
+  }
+}
+
+bool ConformanceHasEffectRequest::evaluate(
+  Evaluator &evaluator, EffectKind kind,
+  ProtocolConformance *conformance) const {
+  auto *module = conformance->getDeclContext()->getParentModule();
+
+  llvm::SmallDenseSet<ProtocolConformance *, 2> visited;
+  SmallVector<ProtocolConformance *, 2> worklist;
+
+  worklist.push_back(conformance);
+
+  while (!worklist.empty()) {
+    auto *current = worklist.back();
+    worklist.pop_back();
+
+    if (!visited.insert(current).second)
+      continue;
+
+    auto protoDecl = current->getProtocol();
+
+    auto list = protoDecl->getPolymorphicEffectRequirements(kind);
+    for (auto req : list.getRequirements()) {
+      if (classifyWitness(module, current, req, kind))
+        return true;
+    }
+
+    for (auto pair : list.getConformances()) {
+      auto assocConf = 
+          current->getAssociatedConformance(
+              pair.first, pair.second);
+      if (!assocConf.isConcrete())
+        return true;
+
+      worklist.push_back(assocConf.getConcrete());
+    }
+  }
+
+  return false;
+}
 
 namespace {
 
@@ -42,42 +243,59 @@ private:
     Expr *TheExpr;
   };
   unsigned TheKind : 2;
-  unsigned IsRethrows : 1;
   unsigned ParamCount : 2;
+  PolymorphicEffectKind RethrowingKind;
+  SubstitutionMap Substitutions;
 
 public:
   explicit AbstractFunction(Kind kind, Expr *fn)
     : TheKind(kind),
-      IsRethrows(false),
-      ParamCount(1) {
+      ParamCount(1),
+      RethrowingKind(PolymorphicEffectKind::None) {
     TheExpr = fn;
   }
 
-  explicit AbstractFunction(AbstractFunctionDecl *fn)
+  explicit AbstractFunction(AbstractFunctionDecl *fn, SubstitutionMap subs)
     : TheKind(Kind::Function),
-      IsRethrows(fn->getAttrs().hasAttribute<RethrowsAttr>()),
-      ParamCount(fn->getNumCurryLevels()) {
+      ParamCount(fn->getNumCurryLevels()),
+      RethrowingKind(fn->getPolymorphicEffectKind(EffectKind::Throws)),
+      Substitutions(subs) {
     TheFunction = fn;
   }
 
   explicit AbstractFunction(AbstractClosureExpr *closure)
     : TheKind(Kind::Closure),
-      IsRethrows(false),
-      ParamCount(1) {
+      ParamCount(1),
+      RethrowingKind(PolymorphicEffectKind::None) {
     TheClosure = closure;
   }
 
   explicit AbstractFunction(ParamDecl *parameter)
     : TheKind(Kind::Parameter),
-      IsRethrows(false),
-      ParamCount(1) {
+      ParamCount(1),
+      RethrowingKind(PolymorphicEffectKind::None) {
     TheParameter = parameter;
   }
 
   Kind getKind() const { return Kind(TheKind); }
 
   /// Whether the function is marked 'rethrows'.
-  bool isBodyRethrows() const { return IsRethrows; }
+  bool isBodyRethrows() const {
+    switch (RethrowingKind) {
+    case PolymorphicEffectKind::None:
+    case PolymorphicEffectKind::Always:
+      return false;
+
+    case PolymorphicEffectKind::ByClosure:
+    case PolymorphicEffectKind::ByConformance:
+    case PolymorphicEffectKind::Invalid:
+      return true;
+    }
+  }
+
+  PolymorphicEffectKind getRethrowingKind() const {
+    return RethrowingKind;
+  }
 
   unsigned getNumArgumentsForFullApply() const {
     return ParamCount;
@@ -116,11 +334,26 @@ public:
     return TheExpr;
   }
 
+  SubstitutionMap getSubstitutions() const {
+    return Substitutions;
+  }
+
   static AbstractFunction decomposeApply(ApplyExpr *apply,
-                                         SmallVectorImpl<Expr*> &args) {
+                           SmallVectorImpl<SmallVector<Expr *, 2>> &argLists) {
     Expr *fn;
     do {
-      args.push_back(apply->getArg());
+      auto *argExpr = apply->getArg();
+      if (auto *tupleExpr = dyn_cast<TupleExpr>(argExpr)) {
+        auto args = tupleExpr->getElements();
+        argLists.emplace_back(args.begin(), args.end());
+      } else if (auto *parenExpr = dyn_cast<ParenExpr>(argExpr)) {
+        argLists.emplace_back();
+        argLists.back().push_back(parenExpr->getSubExpr());
+      } else {
+        argLists.emplace_back();
+        argLists.back().push_back(argExpr);
+      }
+
       fn = apply->getFn()->getValueProvidingExpr();
     } while ((apply = dyn_cast<ApplyExpr>(fn)));
 
@@ -158,14 +391,15 @@ public:
     
     // Constructor delegation.
     if (auto otherCtorDeclRef = dyn_cast<OtherConstructorDeclRefExpr>(fn)) {
-      return AbstractFunction(otherCtorDeclRef->getDecl());
+      return AbstractFunction(otherCtorDeclRef->getDecl(),
+                              otherCtorDeclRef->getDeclRef().getSubstitutions());
     }
 
     // Normal function references.
-    if (auto declRef = dyn_cast<DeclRefExpr>(fn)) {
-      ValueDecl *decl = declRef->getDecl();
+    if (auto DRE = dyn_cast<DeclRefExpr>(fn)) {
+      ValueDecl *decl = DRE->getDecl();
       if (auto fn = dyn_cast<AbstractFunctionDecl>(decl)) {
-        return AbstractFunction(fn);
+        return AbstractFunction(fn, DRE->getDeclRef().getSubstitutions());
       } else if (auto param = dyn_cast<ParamDecl>(decl)) {
         return AbstractFunction(param);
       }
@@ -244,6 +478,8 @@ public:
       recurse = asImpl().checkDoCatch(doCatch);
     } else if (auto thr = dyn_cast<ThrowStmt>(S)) {
       recurse = asImpl().checkThrow(thr);
+    } else if (auto forEach = dyn_cast<ForEachStmt>(S)) {
+      recurse = asImpl().checkForEach(forEach);
     }
     return {bool(recurse), S};
   }
@@ -256,6 +492,10 @@ public:
       asImpl().checkCatch(clause, bodyResult);
     }
     return ShouldNotRecurse;
+  }
+
+  ShouldRecurse_t checkForEach(ForEachStmt *S) {
+    return ShouldRecurse;
   }
 };
 
@@ -279,6 +519,10 @@ public:
     /// The function is 'rethrows', and it was passed a default
     /// argument that was not rethrowing-only in this context.
     CallRethrowsWithDefaultThrowingArgument,
+
+    /// The the function is 'rethrows', and it is a member that
+    /// is a conformance to a rethrowing protocol.
+    CallRethrowsWithConformance,
   };
 
   static StringRef kindToString(Kind k) {
@@ -290,6 +534,8 @@ public:
         return "CallRethrowsWithExplicitThrowingArgument";
       case Kind::CallRethrowsWithDefaultThrowingArgument: 
         return "CallRethrowsWithDefaultThrowingArgument";
+      case Kind::CallRethrowsWithConformance:
+        return "CallRethrowsWithConformance";
     }
   }
 
@@ -307,6 +553,11 @@ public:
   static PotentialThrowReason forDefaultArgument() {
     return PotentialThrowReason(Kind::CallRethrowsWithDefaultThrowingArgument);
   }
+  static PotentialThrowReason forRethrowsConformance(Expr *E) {
+    PotentialThrowReason result(Kind::CallRethrowsWithConformance);
+    result.TheExpression = E;
+    return result;
+  }
   static PotentialThrowReason forThrowingApply() {
     return PotentialThrowReason(Kind::CallThrows);
   }
@@ -323,7 +574,8 @@ public:
   bool isThrow() const { return getKind() == Kind::Throw; }
   bool isRethrowsCall() const {
     return (getKind() == Kind::CallRethrowsWithExplicitThrowingArgument ||
-            getKind() == Kind::CallRethrowsWithDefaultThrowingArgument);
+            getKind() == Kind::CallRethrowsWithDefaultThrowingArgument ||
+            getKind() == Kind::CallRethrowsWithConformance);
   }
 
   /// If this was built with forRethrowsArgument, return the expression.
@@ -463,31 +715,33 @@ public:
     auto fnType = type->getAs<AnyFunctionType>();
     if (!fnType) return Classification::forInvalidCode();
 
-    bool isAsync = fnType->isAsync();
-    
-    // If the function doesn't throw at all, we're done here.
-    if (!fnType->isThrowing())
-      return isAsync ? Classification::forAsync() : Classification();
-
+    bool isAsync = fnType->isAsync() || E->implicitlyAsync();
     // Decompose the application.
-    SmallVector<Expr*, 4> args;
-    auto fnRef = AbstractFunction::decomposeApply(E, args);
+    SmallVector<SmallVector<Expr *, 2>, 2> argLists;
+    auto fnRef = AbstractFunction::decomposeApply(E, argLists);
 
     // If any of the arguments didn't type check, fail.
-    for (auto arg : args) {
-      if (!arg->getType() || arg->getType()->hasError())
-        return Classification::forInvalidCode();
+    for (auto argList : argLists) {
+      for (auto *arg : argList) {
+        if (!arg->getType() || arg->getType()->hasError())
+          return Classification::forInvalidCode();
+      }
+    }
+
+    // If the function doesn't throw at all, we're done here.
+    if (!fnType->isThrowing()) {
+      return isAsync ? Classification::forAsync() : Classification();
     }
 
     // If we're applying more arguments than the natural argument
     // count, then this is a call to the opaque value returned from
     // the function.
-    if (args.size() != fnRef.getNumArgumentsForFullApply()) {
+    if (argLists.size() != fnRef.getNumArgumentsForFullApply()) {
       // Special case: a reference to an operator within a type might be
       // missing 'self'.
       // FIXME: The issue here is that this is an ill-formed expression, but
       // we don't know it from the structure of the expression.
-      if (args.size() == 1 && fnRef.getKind() == AbstractFunction::Function &&
+      if (argLists.size() == 1 && fnRef.getKind() == AbstractFunction::Function &&
           isa<FuncDecl>(fnRef.getFunction()) &&
           cast<FuncDecl>(fnRef.getFunction())->isOperator() &&
           fnRef.getNumArgumentsForFullApply() == 2 &&
@@ -497,10 +751,20 @@ public:
         return Classification::forInvalidCode();
       }
 
-      assert(args.size() > fnRef.getNumArgumentsForFullApply() &&
+      assert(argLists.size() > fnRef.getNumArgumentsForFullApply() &&
              "partial application was throwing?");
       return Classification::forThrow(PotentialThrowReason::forThrowingApply(),
                                       isAsync);
+    }
+
+    if (fnRef.getRethrowingKind() == PolymorphicEffectKind::ByConformance) {
+      auto substitutions = fnRef.getSubstitutions();
+      for (auto conformanceRef : substitutions.getConformances()) {
+        if (conformanceRef.hasEffect(EffectKind::Throws)) {
+          return Classification::forRethrowingOnly(
+            PotentialThrowReason::forRethrowsConformance(E), isAsync);
+        }
+      }
     }
 
     // If the function's body is 'rethrows' for the number of
@@ -515,13 +779,20 @@ public:
       // Use the most significant result from the arguments.
       Classification result = isAsync ? Classification::forAsync() 
                                       : Classification();
-      for (auto arg : llvm::reverse(args)) {
+      for (auto argList : llvm::reverse(argLists)) {
         auto fnType = type->getAs<AnyFunctionType>();
-        if (!fnType) return Classification::forInvalidCode();
+        if (!fnType)
+          return Classification::forInvalidCode();
 
-        auto paramType = FunctionType::composeInput(fnType->getASTContext(),
-                                                    fnType->getParams(), false);
-        result.merge(classifyRethrowsArgument(arg, paramType));
+        auto params = fnType->getParams();
+        if (params.size() != argList.size())
+          return Classification::forInvalidCode();
+
+        for (unsigned i = 0, e = params.size(); i < e; ++i) {
+          result.merge(classifyRethrowsArgument(argList[i],
+                                                params[i].getParameterType()));
+        }
+
         type = fnType->getResult();
       }
       return result;
@@ -966,7 +1237,8 @@ public:
     if (!fn)
       return false;
 
-    return fn->getAttrs().hasAttribute<RethrowsAttr>();
+    return fn->getPolymorphicEffectKind(EffectKind::Throws)
+        == PolymorphicEffectKind::ByClosure;
   }
 
   /// Whether this is an autoclosure.
@@ -985,8 +1257,9 @@ public:
   }
 
   static Context forTopLevelCode(TopLevelCodeDecl *D) {
-    // Top-level code implicitly handles errors and 'async' calls.
-    return Context(/*handlesErrors=*/true, /*handlesAsync=*/true, None);
+    // Top-level code implicitly handles errors.
+    // TODO: Eventually, it will handle async as well.
+    return Context(/*handlesErrors=*/true, /*handlesAsync=*/false, None);
   }
 
   static Context forFunction(AbstractFunctionDecl *D) {
@@ -1140,6 +1413,9 @@ public:
       return;
     case PotentialThrowReason::Kind::CallRethrowsWithDefaultThrowingArgument:
       Diags.diagnose(loc, diag::because_rethrows_default_argument_throws);
+      return;
+    case PotentialThrowReason::Kind::CallRethrowsWithConformance:
+      Diags.diagnose(loc, diag::because_rethrows_default_conformance_throws);
       return;
     }
     llvm_unreachable("bad reason kind");
@@ -1381,11 +1657,8 @@ public:
     if (!Function)
       return;
 
-    auto func = dyn_cast_or_null<FuncDecl>(Function->getAbstractFunctionDecl());
-    if (!func)
-      return;
-
-    addAsyncNotes(func);
+    if (auto func = Function->getAbstractFunctionDecl())
+      addAsyncNotes(func);
   }
 
   void diagnoseUnhandledAsyncSite(DiagnosticEngine &Diags, ASTNode node) {
@@ -1534,10 +1807,15 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
       Self.Flags.set(ContextFlags::IsTryCovered);
       Self.Flags.clear(ContextFlags::HasTryThrowSite);
     }
-    
+
     void enterAwait() {
       Self.Flags.set(ContextFlags::IsAsyncCovered);
       Self.Flags.clear(ContextFlags::HasAnyAsyncSite);
+    }
+
+    void enterAsyncLet() {
+      Self.Flags.set(ContextFlags::IsTryCovered);
+      Self.Flags.set(ContextFlags::IsAsyncCovered);
     }
 
     void refineLocalContext(Context newContext) {
@@ -1581,10 +1859,22 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
       OldMaxThrowingKind = std::max(OldMaxThrowingKind, Self.MaxThrowingKind);
     }
 
+    void preserveDiagnoseErrorOnTryFlag() {
+      // The "DiagnoseErrorOnTry" flag is a bit of mutable state
+      // in the Context itself, used to postpone diagnostic emission
+      // to a parent "try" expression. If something was diagnosed
+      // during this ContextScope, the flag may have been set, and
+      // we need to preseve its value when restoring the old Context.
+      bool DiagnoseErrorOnTry = Self.CurContext.shouldDiagnoseErrorOnTry();
+      OldContext.setDiagnoseErrorOnTry(DiagnoseErrorOnTry);
+    }
+
     void preserveCoverageFromAwaitOperand() {
       OldFlags.mergeFrom(ContextFlags::HasAnyAwait, Self.Flags);
       OldFlags.mergeFrom(ContextFlags::throwFlags(), Self.Flags);
       OldMaxThrowingKind = std::max(OldMaxThrowingKind, Self.MaxThrowingKind);
+
+      preserveDiagnoseErrorOnTryFlag();
     }
 
     void preserveCoverageFromTryOperand() {
@@ -1603,22 +1893,16 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
       OldFlags.mergeFrom(ContextFlags::HasAnyAsyncSite, Self.Flags);
       OldFlags.mergeFrom(ContextFlags::HasAnyAwait, Self.Flags);
       OldMaxThrowingKind = std::max(OldMaxThrowingKind, Self.MaxThrowingKind);
+
+      preserveDiagnoseErrorOnTryFlag();
     }
-    
+
     bool wasTopLevelDebuggerFunction() const {
       return OldFlags.has(ContextFlags::IsTopLevelDebuggerFunction);
     }
 
     ~ContextScope() {
-      // The "DiagnoseErrorOnTry" flag is a bit of mutable state
-      // in the Context itself, used to postpone diagnostic emission
-      // to a parent "try" expression. If something was diagnosed
-      // during this ContextScope, the flag may have been set, and
-      // we need to preseve its value when restoring the old Context.
-      bool DiagnoseErrorOnTry = Self.CurContext.shouldDiagnoseErrorOnTry();
       Self.CurContext = OldContext;
-      Self.CurContext.setDiagnoseErrorOnTry(DiagnoseErrorOnTry);
-
       Self.RethrowsDC = OldRethrowsDC;
       Self.Flags = OldFlags;
       Self.MaxThrowingKind = OldMaxThrowingKind;
@@ -1680,6 +1964,7 @@ private:
 
     case AutoClosureExpr::Kind::AsyncLet:
       scope.resetCoverage();
+      scope.enterAsyncLet();
       shouldPreserveCoverage = false;
       break;
     }
@@ -1819,10 +2104,11 @@ private:
   }
 
   ShouldRecurse_t checkAsyncLet(PatternBindingDecl *patternBinding) {
-      // Diagnose async calls in a context that doesn't handle async.
-      if (!CurContext.handlesAsync()) {
-        CurContext.diagnoseUnhandledAsyncSite(Ctx.Diags, patternBinding);
-      }
+    // Diagnose async let in a context that doesn't handle async.
+    if (!CurContext.handlesAsync()) {
+      CurContext.diagnoseUnhandledAsyncSite(Ctx.Diags, patternBinding);
+    }
+
     return ShouldRecurse;
   }
 
@@ -2008,6 +2294,36 @@ private:
     scope.preserveCoverageFromOptionalOrForcedTryOperand();
     return ShouldNotRecurse;
   }
+
+  ShouldRecurse_t checkForEach(ForEachStmt *S) {
+    if (S->getTryLoc().isValid() && 
+        !Flags.has(ContextFlags::IsTryCovered)) {
+      checkThrowAsyncSite(S, /*requiresTry*/ false,
+                        Classification::forThrow(PotentialThrowReason::forThrow(),
+                                                 /*async*/false));
+    }
+    if (S->getAwaitLoc().isValid() && 
+        !Flags.has(ContextFlags::HasAnyAsyncSite)) {
+      if (!CurContext.handlesAsync()) {
+        CurContext.diagnoseUnhandledAsyncSite(Ctx.Diags, S);
+      }
+    }
+    return ShouldRecurse;
+  }
+};
+
+// Find nested functions and perform effects checking on them.
+struct LocalFunctionEffectsChecker : ASTWalker {
+  bool walkToDeclPre(Decl *D) override {
+    if (auto func = dyn_cast<AbstractFunctionDecl>(D)) {
+      if (func->getDeclContext()->isLocalContext())
+        TypeChecker::checkFunctionEffects(func);
+
+      return false;
+    }
+
+    return true;
+  }
 };
 
 } // end anonymous namespace
@@ -2021,6 +2337,7 @@ void TypeChecker::checkTopLevelEffects(TopLevelCodeDecl *code) {
     checker.setTopLevelThrowWithoutTry();
 
   code->getBody()->walk(checker);
+  code->getBody()->walk(LocalFunctionEffectsChecker());
 }
 
 void TypeChecker::checkFunctionEffects(AbstractFunctionDecl *fn) {
@@ -2040,7 +2357,9 @@ void TypeChecker::checkFunctionEffects(AbstractFunctionDecl *fn) {
 
   if (auto body = fn->getBody()) {
     body->walk(checker);
+    body->walk(LocalFunctionEffectsChecker());
   }
+
   if (auto ctor = dyn_cast<ConstructorDecl>(fn))
     if (auto superInit = ctor->getSuperInitCall())
       superInit->walk(checker);
@@ -2051,6 +2370,7 @@ void TypeChecker::checkInitializerEffects(Initializer *initCtx,
   auto &ctx = initCtx->getASTContext();
   CheckEffectsCoverage checker(ctx, Context::forInitializer(initCtx));
   init->walk(checker);
+  init->walk(LocalFunctionEffectsChecker());
 }
 
 /// Check the correctness of effects within the given enum
@@ -2065,6 +2385,7 @@ void TypeChecker::checkEnumElementEffects(EnumElementDecl *elt, Expr *E) {
   auto &ctx = elt->getASTContext();
   CheckEffectsCoverage checker(ctx, Context::forEnumElementInitializer(elt));
   E->walk(checker);
+  E->walk(LocalFunctionEffectsChecker());
 }
 
 void TypeChecker::checkPropertyWrapperEffects(
@@ -2072,6 +2393,7 @@ void TypeChecker::checkPropertyWrapperEffects(
   auto &ctx = binding->getASTContext();
   CheckEffectsCoverage checker(ctx, Context::forPatternBinding(binding));
   expr->walk(checker);
+  expr->walk(LocalFunctionEffectsChecker());
 }
 
 bool TypeChecker::canThrow(Expr *expr) {

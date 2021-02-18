@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintGraphScope.h"
@@ -83,8 +84,13 @@ ConstraintGraph::lookupNode(TypeVariableType *typeVar) {
   return { *nodePtr, index };
 }
 
+bool ConstraintGraphNode::forRepresentativeVar() const {
+  auto *typeVar = getTypeVariable();
+  return typeVar == typeVar->getImpl().getRepresentative(nullptr);
+}
+
 ArrayRef<TypeVariableType *> ConstraintGraphNode::getEquivalenceClass() const{
-  assert(TypeVar == TypeVar->getImpl().getRepresentative(nullptr) &&
+  assert(forRepresentativeVar() &&
          "Can't request equivalence class from non-representative type var");
   return getEquivalenceClassUnsafe();
 }
@@ -130,10 +136,10 @@ void ConstraintGraphNode::removeConstraint(Constraint *constraint) {
 
 void ConstraintGraphNode::addToEquivalenceClass(
        ArrayRef<TypeVariableType *> typeVars) {
-  assert(TypeVar == TypeVar->getImpl().getRepresentative(nullptr) &&
+  assert(forRepresentativeVar() &&
          "Can't extend equivalence class of non-representative type var");
   if (EquivalenceClass.empty())
-    EquivalenceClass.push_back(TypeVar);
+    EquivalenceClass.push_back(getTypeVariable());
   EquivalenceClass.append(typeVars.begin(), typeVars.end());
 }
 
@@ -339,17 +345,15 @@ void ConstraintGraph::bindTypeVariable(TypeVariableType *typeVar, Type fixed) {
   if (!fixed->hasTypeVariable())
     return;
 
-  SmallVector<TypeVariableType *, 4> typeVars;
-  llvm::SmallPtrSet<TypeVariableType *, 4> knownTypeVars;
+  llvm::SmallPtrSet<TypeVariableType *, 4> typeVars;
   fixed->getTypeVariables(typeVars);
   auto &node = (*this)[typeVar];
   for (auto otherTypeVar : typeVars) {
-    if (knownTypeVars.insert(otherTypeVar).second) {
-      if (typeVar == otherTypeVar) continue;
+    if (typeVar == otherTypeVar)
+      continue;
 
-      (*this)[otherTypeVar].addFixedBinding(typeVar);
-      node.addFixedBinding(otherTypeVar);
-    }
+    (*this)[otherTypeVar].addFixedBinding(typeVar);
+    node.addFixedBinding(otherTypeVar);
   }
 
   // Record the change, if there are active scopes.
@@ -364,15 +368,12 @@ void ConstraintGraph::unbindTypeVariable(TypeVariableType *typeVar, Type fixed){
   if (!fixed->hasTypeVariable())
     return;
 
-  SmallVector<TypeVariableType *, 4> typeVars;
-  llvm::SmallPtrSet<TypeVariableType *, 4> knownTypeVars;
+  llvm::SmallPtrSet<TypeVariableType *, 4> typeVars;
   fixed->getTypeVariables(typeVars);
   auto &node = (*this)[typeVar];
   for (auto otherTypeVar : typeVars) {
-    if (knownTypeVars.insert(otherTypeVar).second) {
-      (*this)[otherTypeVar].removeFixedBinding(typeVar);
-      node.removeFixedBinding(otherTypeVar);
-    }
+    (*this)[otherTypeVar].removeFixedBinding(typeVar);
+    node.removeFixedBinding(otherTypeVar);
   }
 }
 
@@ -674,7 +675,7 @@ namespace {
             if (validComponents.count(inAdj) == 0)
               continue;
 
-            component.dependsOn.push_back(getComponent(inAdj).solutionIndex);
+            component.recordDependency(getComponent(inAdj));
           }
         }
       }
@@ -808,7 +809,7 @@ namespace {
     getRepresentativesInType(Type type) const {
       TinyPtrVector<TypeVariableType *> results;
 
-      SmallVector<TypeVariableType *, 2> typeVars;
+      SmallPtrSet<TypeVariableType *, 2> typeVars;
       type->getTypeVariables(typeVars);
       for (auto typeVar : typeVars) {
         auto rep = findRepresentative(typeVar);
@@ -1054,6 +1055,10 @@ void ConstraintGraph::Component::addConstraint(Constraint *constraint) {
   constraints.push_back(constraint);
 }
 
+void ConstraintGraph::Component::recordDependency(const Component &component) {
+  dependencies.push_back(component.solutionIndex);
+}
+
 SmallVector<ConstraintGraph::Component, 1>
 ConstraintGraph::computeConnectedComponents(
            ArrayRef<TypeVariableType *> typeVars) {
@@ -1113,7 +1118,7 @@ bool ConstraintGraph::contractEdges() {
       bool isNotContractable = true;
       if (auto bindings = CS.inferBindingsFor(tyvar1)) {
         // Holes can't be contracted.
-        if (bindings.IsHole)
+        if (bindings.isHole())
           continue;
 
         for (auto &binding : bindings.Bindings) {
@@ -1189,6 +1194,7 @@ void ConstraintGraphNode::print(llvm::raw_ostream &out, unsigned indent,
     SmallVector<Constraint *, 4> sortedConstraints(Constraints.begin(),
                                                    Constraints.end());
     std::sort(sortedConstraints.begin(), sortedConstraints.end());
+
     for (auto constraint : sortedConstraints) {
       out.indent(indent + 4);
       constraint->print(out, &TypeVar->getASTContext().SourceMgr);
@@ -1218,8 +1224,7 @@ void ConstraintGraphNode::print(llvm::raw_ostream &out, unsigned indent,
   }
 
   // Print equivalence class.
-  if (TypeVar->getImpl().getRepresentative(nullptr) == TypeVar &&
-      EquivalenceClass.size() > 1) {
+  if (forRepresentativeVar() && EquivalenceClass.size() > 1) {
     out.indent(indent + 2);
     out << "Equivalence class:";
     for (unsigned i = 1, n = EquivalenceClass.size(); i != n; ++i) {
@@ -1277,16 +1282,19 @@ void ConstraintGraph::printConnectedComponents(
                  out << ' ';
                });
 
-    if (component.dependsOn.empty())
+    auto dependencies = component.getDependencies();
+    if (dependencies.empty())
       continue;
+
+    SmallVector<unsigned, 4> indices{dependencies.begin(), dependencies.end()};
+    // Sort dependencies so output is stable.
+    llvm::sort(indices);
 
     // Print all of the one-way components.
     out << " depends on ";
     llvm::interleave(
-        component.dependsOn,
-        [&](unsigned index) { out << index; },
-        [&] { out << ", "; }
-      );
+        indices, [&out](unsigned index) { out << index; },
+        [&out] { out << ", "; });
   }
 }
 

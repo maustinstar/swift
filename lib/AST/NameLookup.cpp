@@ -510,6 +510,21 @@ static void recordShadowedDeclsAfterTypeMatch(
         }
       }
 
+      // Next, prefer any other module over the _Concurrency module.
+      if (auto concurModule = ctx.getLoadedModule(ctx.Id_Concurrency)) {
+        if ((firstModule == concurModule) != (secondModule == concurModule)) {
+          // If second module is _Concurrency, then it is shadowed by first.
+          if (secondModule == concurModule) {
+            shadowed.insert(secondDecl);
+            continue;
+          }
+
+          // Otherwise, the first declaration is shadowed by the second.
+          shadowed.insert(firstDecl);
+          break;
+        }
+      }
+
       // The Foundation overlay introduced Data.withUnsafeBytes, which is
       // treated as being ambiguous with SwiftNIO's Data.withUnsafeBytes
       // extension. Apply a special-case name shadowing rule to use the
@@ -1044,7 +1059,7 @@ public:
   /// Returns \c true if the lookup table has a complete accounting of the
   /// given name.
   bool isLazilyComplete(DeclBaseName name) const {
-    return LazilyCompleteNames.find(name) != LazilyCompleteNames.end();
+    return LazilyCompleteNames.contains(name);
   }
 
   /// Mark a given lazily-loaded name as being complete.
@@ -1856,6 +1871,11 @@ AnyObjectLookupRequest::evaluate(Evaluator &evaluator, const DeclContext *dc,
                                  DeclNameRef member, NLOptions options) const {
   using namespace namelookup;
   QualifiedLookupResult decls;
+
+#if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
+  // Avoid calling `clang::ObjCMethodDecl::isDirectMethod()`.
+  return decls;
+#endif
 
   // Type-only lookup won't find anything on AnyObject.
   if (options & NL_OnlyTypes)

@@ -1001,7 +1001,8 @@ SerializedModuleLoaderBase::loadModule(SourceLoc importLoc,
     // Don't record cached artifacts as dependencies.
     if (!isCached(DepPath)) {
       if (M->hasIncrementalInfo()) {
-        dependencyTracker->addIncrementalDependency(DepPath);
+        dependencyTracker->addIncrementalDependency(DepPath,
+                                                    M->getFingerprint());
       } else {
         dependencyTracker->addDependency(DepPath, /*isSystem=*/false);
       }
@@ -1215,6 +1216,11 @@ void SerializedASTFile::lookupObjCMethods(
   File.lookupObjCMethods(selector, results);
 }
 
+Optional<Fingerprint>
+SerializedASTFile::loadFingerprint(const IterableDeclContext *IDC) const {
+  return File.loadFingerprint(IDC);
+}
+
 void SerializedASTFile::lookupImportedSPIGroups(
                         const ModuleDecl *importedModule,
                         llvm::SmallSetVector<Identifier, 4> &spiGroups) const {
@@ -1262,6 +1268,10 @@ SerializedASTFile::getTopLevelDecls(SmallVectorImpl<Decl*> &results) const {
   File.getTopLevelDecls(results);
 }
 
+void SerializedASTFile::getExportedPrespecializations(
+    SmallVectorImpl<Decl *> &results) const {
+  File.getExportedPrespecializations(results);
+}
 void SerializedASTFile::getTopLevelDeclsWhereAttributesMatch(
               SmallVectorImpl<Decl*> &results,
               llvm::function_ref<bool(DeclAttributes)> matchAttributes) const {
@@ -1317,4 +1327,9 @@ SerializedASTFile::getDiscriminatorForPrivateValue(const ValueDecl *D) const {
   Identifier discriminator = File.getDiscriminatorForPrivateValue(D);
   assert(!discriminator.empty() && "no discriminator found for value");
   return discriminator;
+}
+
+void SerializedASTFile::collectBasicSourceFileInfo(
+    llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const {
+  File.collectBasicSourceFileInfo(callback);
 }

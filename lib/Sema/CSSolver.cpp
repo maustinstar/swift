@@ -18,6 +18,7 @@
 #include "TypeChecker.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/TypeWalker.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/SolutionResult.h"
@@ -184,9 +185,6 @@ Solution ConstraintSystem::finalize() {
   solution.solutionApplicationTargets = solutionApplicationTargets;
   solution.caseLabelItems = caseLabelItems;
 
-  for (auto &e : CheckedConformances)
-    solution.Conformances.push_back({e.first, e.second});
-
   for (const auto &transformed : resultBuilderTransformed) {
     solution.resultBuilderTransformed.insert(transformed);
   }
@@ -271,10 +269,6 @@ void ConstraintSystem::applySolution(const Solution &solution) {
     if (!getCaseLabelItemInfo(info.first))
       setCaseLabelItemInfo(info.first, info.second);
   }
-
-  // Register the conformances checked along the way to arrive to solution.
-  for (auto &conformance : solution.Conformances)
-    CheckedConformances.push_back(conformance);
 
   for (const auto &transformed : solution.resultBuilderTransformed) {
     resultBuilderTransformed.push_back(transformed);
@@ -471,12 +465,12 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numFixes = cs.Fixes.size();
   numFixedRequirements = cs.FixedRequirements.size();
   numDisjunctionChoices = cs.DisjunctionChoices.size();
+  numAppliedDisjunctions = cs.AppliedDisjunctions.size();
   numTrailingClosureMatchingChoices = cs.trailingClosureMatchingChoices.size();
   numOpenedTypes = cs.OpenedTypes.size();
   numOpenedExistentialTypes = cs.OpenedExistentialTypes.size();
   numDefaultedConstraints = cs.DefaultedConstraints.size();
   numAddedNodeTypes = cs.addedNodeTypes.size();
-  numCheckedConformances = cs.CheckedConformances.size();
   numDisabledConstraints = cs.solverState->getNumDisabledConstraints();
   numFavoredConstraints = cs.solverState->getNumFavoredConstraints();
   numResultBuilderTransformed = cs.resultBuilderTransformed.size();
@@ -526,6 +520,9 @@ ConstraintSystem::SolverScope::~SolverScope() {
   // Remove any disjunction choices.
   truncate(cs.DisjunctionChoices, numDisjunctionChoices);
 
+  // Remove any applied disjunctions.
+  truncate(cs.AppliedDisjunctions, numAppliedDisjunctions);
+
   // Remove any trailing closure matching choices;
   truncate(
       cs.trailingClosureMatchingChoices, numTrailingClosureMatchingChoices);
@@ -553,9 +550,6 @@ ConstraintSystem::SolverScope::~SolverScope() {
       cs.NodeTypes.erase(node);
   }
   truncate(cs.addedNodeTypes, numAddedNodeTypes);
-
-  // Remove any conformances checked along the current path.
-  truncate(cs.CheckedConformances, numCheckedConformances);
 
   /// Remove any builder transformed closures.
   truncate(cs.resultBuilderTransformed, numResultBuilderTransformed);
@@ -2013,6 +2007,157 @@ static Constraint *tryOptimizeGenericDisjunction(
   llvm_unreachable("covered switch");
 }
 
+/// Populates the \c found vector with the indices of the given constraints
+/// that have a matching type to an existing operator binding elsewhere in
+/// the expression.
+///
+/// Operator bindings that have a matching type to an existing binding
+/// are attempted first by the solver because it's very common to chain
+/// operators of the same type together.
+static void existingOperatorBindingsForDisjunction(ConstraintSystem &CS,
+                                                   ArrayRef<Constraint *> constraints,
+                                                   SmallVectorImpl<unsigned> &found) {
+  auto *choice = constraints.front();
+  if (choice->getKind() != ConstraintKind::BindOverload)
+    return;
+
+  auto overload = choice->getOverloadChoice();
+  if (!overload.isDecl())
+    return;
+  auto decl = overload.getDecl();
+  if (!decl->isOperator())
+    return;
+
+  // For concrete operators, consider overloads that have the same type as
+  // an existing binding, because it's very common to write mixed operator
+  // expressions where all operands have the same type, e.g. `(x + 10) / 2`.
+  // For generic operators, only favor an exact overload that has already
+  // been bound, because mixed operator expressions are far less common, and
+  // computing generic canonical types is expensive.
+  SmallSet<CanType, 4> concreteTypesFound;
+  SmallSet<ValueDecl *, 4> genericDeclsFound;
+  for (auto overload : CS.getResolvedOverloads()) {
+    auto resolved = overload.second;
+    if (!resolved.choice.isDecl())
+      continue;
+
+    auto representativeDecl = resolved.choice.getDecl();
+    if (!representativeDecl->isOperator())
+      continue;
+
+    auto interfaceType = representativeDecl->getInterfaceType();
+    if (interfaceType->is<GenericFunctionType>()) {
+      genericDeclsFound.insert(representativeDecl);
+    } else {
+      concreteTypesFound.insert(interfaceType->getCanonicalType());
+    }
+  }
+
+  for (auto index : indices(constraints)) {
+    auto *constraint = constraints[index];
+    if (constraint->isFavored())
+      continue;
+
+    auto *decl = constraint->getOverloadChoice().getDecl();
+    auto interfaceType = decl->getInterfaceType();
+    bool isGeneric = interfaceType->is<GenericFunctionType>();
+    if ((isGeneric && genericDeclsFound.count(decl)) ||
+        (!isGeneric && concreteTypesFound.count(interfaceType->getCanonicalType())))
+      found.push_back(index);
+  }
+}
+
+void ConstraintSystem::partitionGenericOperators(ArrayRef<Constraint *> constraints,
+                                                 SmallVectorImpl<unsigned>::iterator first,
+                                                 SmallVectorImpl<unsigned>::iterator last,
+                                                 ConstraintLocator *locator) {
+  auto *argFnType = AppliedDisjunctions[locator];
+  if (!isOperatorBindOverload(constraints[0]) || !argFnType)
+    return;
+
+  auto operatorName = constraints[0]->getOverloadChoice().getName();
+  if (!operatorName.getBaseIdentifier().isArithmeticOperator())
+    return;
+
+  SmallVector<unsigned, 4> concreteOverloads;
+  SmallVector<unsigned, 4> numericOverloads;
+  SmallVector<unsigned, 4> sequenceOverloads;
+  SmallVector<unsigned, 4> otherGenericOverloads;
+
+  auto refinesOrConformsTo = [&](NominalTypeDecl *nominal, KnownProtocolKind kind) -> bool {
+    if (!nominal)
+      return false;
+
+    auto *protocol = TypeChecker::getProtocol(getASTContext(), SourceLoc(), kind);
+
+    if (auto *refined = dyn_cast<ProtocolDecl>(nominal))
+      return refined->inheritsFrom(protocol);
+
+    return (bool)TypeChecker::conformsToProtocol(nominal->getDeclaredType(), protocol,
+                                                 nominal->getDeclContext());
+  };
+
+  // Gather Numeric and Sequence overloads into separate buckets.
+  for (auto iter = first; iter != last; ++iter) {
+    unsigned index = *iter;
+    auto *decl = constraints[index]->getOverloadChoice().getDecl();
+    auto *nominal = decl->getDeclContext()->getSelfNominalTypeDecl();
+    if (!decl->getInterfaceType()->is<GenericFunctionType>()) {
+      concreteOverloads.push_back(index);
+    } else if (refinesOrConformsTo(nominal, KnownProtocolKind::AdditiveArithmetic)) {
+      numericOverloads.push_back(index);
+    } else if (refinesOrConformsTo(nominal, KnownProtocolKind::Sequence)) {
+      sequenceOverloads.push_back(index);
+    } else {
+      otherGenericOverloads.push_back(index);
+    }
+  }
+
+  auto sortPartition = [&](SmallVectorImpl<unsigned> &partition) {
+    llvm::sort(partition, [&](unsigned lhs, unsigned rhs) -> bool {
+      auto *declA = dyn_cast<ValueDecl>(constraints[lhs]->getOverloadChoice().getDecl());
+      auto *declB = dyn_cast<ValueDecl>(constraints[rhs]->getOverloadChoice().getDecl());
+
+      return TypeChecker::isDeclRefinementOf(declA, declB);
+    });
+  };
+
+  // Sort sequence overloads so that refinements are attempted first.
+  // If the solver finds a solution with an overload, it can then skip
+  // subsequent choices that the successful choice is a refinement of.
+  sortPartition(sequenceOverloads);
+
+  // Attempt concrete overloads first.
+  first = std::copy(concreteOverloads.begin(), concreteOverloads.end(), first);
+
+  // Check if any of the known argument types conform to one of the standard
+  // arithmetic protocols. If so, the sovler should attempt the corresponding
+  // overload choices first.
+  for (auto arg : argFnType->getParams()) {
+    auto argType = arg.getPlainType();
+    argType = getFixedTypeRecursive(argType, /*wantRValue=*/true);
+
+    if (argType->isTypeVariableOrMember())
+      continue;
+
+    if (conformsToKnownProtocol(DC, argType, KnownProtocolKind::AdditiveArithmetic)) {
+      first = std::copy(numericOverloads.begin(), numericOverloads.end(), first);
+      numericOverloads.clear();
+      break;
+    }
+
+    if (conformsToKnownProtocol(DC, argType, KnownProtocolKind::Sequence)) {
+      first = std::copy(sequenceOverloads.begin(), sequenceOverloads.end(), first);
+      sequenceOverloads.clear();
+      break;
+    }
+  }
+
+  first = std::copy(otherGenericOverloads.begin(), otherGenericOverloads.end(), first);
+  first = std::copy(numericOverloads.begin(), numericOverloads.end(), first);
+  first = std::copy(sequenceOverloads.begin(), sequenceOverloads.end(), first);
+}
+
 void ConstraintSystem::partitionDisjunction(
     ArrayRef<Constraint *> Choices, SmallVectorImpl<unsigned> &Ordering,
     SmallVectorImpl<unsigned> &PartitionBeginning) {
@@ -2042,11 +2187,17 @@ void ConstraintSystem::partitionDisjunction(
 
   // First collect some things that we'll generally put near the beginning or
   // end of the partitioning.
-
   SmallVector<unsigned, 4> favored;
+  SmallVector<unsigned, 4> everythingElse;
   SmallVector<unsigned, 4> simdOperators;
   SmallVector<unsigned, 4> disabled;
   SmallVector<unsigned, 4> unavailable;
+
+  // Add existing operator bindings to the main partition first. This often
+  // helps the solver find a solution fast.
+  existingOperatorBindingsForDisjunction(*this, Choices, everythingElse);
+  for (auto index : everythingElse)
+    taken.insert(Choices[index]);
 
   // First collect disabled and favored constraints.
   forEachChoice(Choices, [&](unsigned index, Constraint *constraint) -> bool {
@@ -2097,6 +2248,12 @@ void ConstraintSystem::partitionDisjunction(
     });
   }
 
+  // Gather the remaining options.
+  forEachChoice(Choices, [&](unsigned index, Constraint *constraint) -> bool {
+    everythingElse.push_back(index);
+    return true;
+  });
+
   // Local function to create the next partition based on the options
   // passed in.
   PartitionAppendCallback appendPartition =
@@ -2107,17 +2264,9 @@ void ConstraintSystem::partitionDisjunction(
         }
       };
 
-  SmallVector<unsigned, 4> everythingElse;
-  // Gather the remaining options.
-  forEachChoice(Choices, [&](unsigned index, Constraint *constraint) -> bool {
-    everythingElse.push_back(index);
-    return true;
-  });
   appendPartition(favored);
   appendPartition(everythingElse);
   appendPartition(simdOperators);
-
-  // Now create the remaining partitions from what we previously collected.
   appendPartition(unavailable);
   appendPartition(disabled);
 
@@ -2134,13 +2283,45 @@ Constraint *ConstraintSystem::selectDisjunction() {
   if (auto *disjunction = selectBestBindingDisjunction(*this, disjunctions))
     return disjunction;
 
-  // Pick the disjunction with the smallest number of active choices.
-  auto minDisjunction =
-      std::min_element(disjunctions.begin(), disjunctions.end(),
-                       [&](Constraint *first, Constraint *second) -> bool {
-                         return first->countActiveNestedConstraints() <
-                                second->countActiveNestedConstraints();
-                       });
+  // Pick the disjunction with the smallest number of favored, then active choices.
+  auto cs = this;
+  auto minDisjunction = std::min_element(disjunctions.begin(), disjunctions.end(),
+      [&](Constraint *first, Constraint *second) -> bool {
+        unsigned firstActive = first->countActiveNestedConstraints();
+        unsigned secondActive = second->countActiveNestedConstraints();
+        unsigned firstFavored = first->countFavoredNestedConstraints();
+        unsigned secondFavored = second->countFavoredNestedConstraints();
+
+        if (!isOperatorBindOverload(first->getNestedConstraints().front()) ||
+            !isOperatorBindOverload(second->getNestedConstraints().front()))
+          return firstActive < secondActive;
+
+        if (firstFavored == secondFavored) {
+          // Look for additional choices that are "favored"
+          SmallVector<unsigned, 4> firstExisting;
+          SmallVector<unsigned, 4> secondExisting;
+
+          existingOperatorBindingsForDisjunction(*cs, first->getNestedConstraints(), firstExisting);
+          firstFavored += firstExisting.size();
+          existingOperatorBindingsForDisjunction(*cs, second->getNestedConstraints(), secondExisting);
+          secondFavored += secondExisting.size();
+        }
+
+        // Everything else equal, choose the disjunction with the greatest
+        // number of resoved argument types. The number of resolved argument
+        // types is always zero for disjunctions that don't represent applied
+        // overloads.
+        if (firstFavored == secondFavored) {
+          if (firstActive != secondActive)
+            return firstActive < secondActive;
+
+          return (first->countResolvedArgumentTypes(*this) > second->countResolvedArgumentTypes(*this));
+        }
+
+        firstFavored = firstFavored ? firstFavored : firstActive;
+        secondFavored = secondFavored ? secondFavored : secondActive;
+        return firstFavored < secondFavored;
+      });
 
   if (minDisjunction != disjunctions.end())
     return *minDisjunction;
@@ -2201,10 +2382,27 @@ void DisjunctionChoice::propagateConversionInfo(ConstraintSystem &cs) const {
     return;
 
   auto bindings = cs.inferBindingsFor(typeVar);
-  if (bindings.InvolvesTypeVariables || bindings.Bindings.size() != 1)
+
+  auto numBindings =
+      bindings.Bindings.size() + bindings.getNumViableLiteralBindings();
+  if (bindings.isHole() || bindings.involvesTypeVariables() || numBindings != 1)
     return;
 
-  auto conversionType = bindings.Bindings[0].BindingType;
+  Type conversionType;
+
+  // There is either a single direct/transitive binding, or
+  // a single literal default.
+  if (!bindings.Bindings.empty()) {
+    conversionType = bindings.Bindings[0].BindingType;
+  } else {
+    for (const auto &literal : bindings.Literals) {
+      if (literal.second.viableAsBinding()) {
+        conversionType = literal.second.getDefaultType();
+        break;
+      }
+    }
+  }
+
   auto constraints = cs.CG.gatherConstraints(
       typeVar,
       ConstraintGraph::GatheringKind::EquivalenceClass,

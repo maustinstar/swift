@@ -23,6 +23,7 @@
 #include "swift/Basic/Sanitizers.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/OptimizationMode.h"
+#include "swift/Config.h"
 #include "clang/Basic/PointerAuthOptions.h"
 // FIXME: This include is just for llvm::SanitizerCoverageOptions. We should
 // split the header upstream so we don't include so much.
@@ -140,6 +141,18 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
 
   /// The parent async context stored within a child async context.
   PointerAuthSchema AsyncContextParent;
+
+  /// The function to call to resume running in the parent context.
+  PointerAuthSchema AsyncContextResume;
+
+  /// The resume function stored in AsyncTask.
+  PointerAuthSchema TaskResumeFunction;
+
+  /// The async context stored in AsyncTask.
+  PointerAuthSchema TaskResumeContext;
+
+  /// The swift async context entry in the extended frame info.
+  PointerAuthSchema AsyncContextExtendedFrameEntry;
 };
 
 enum class JITDebugArtifact : unsigned {
@@ -186,6 +199,9 @@ public:
 
   /// Which sanitizer(s) have recovery instrumentation enabled.
   OptionSet<SanitizerKind> SanitizersWithRecoveryInstrumentation;
+
+  /// Whether to enable ODR indicators when building with ASan.
+  unsigned SanitizeAddressUseODRIndicator : 1;
 
   /// Path prefixes that should be rewritten in debug info.
   PathRemapper DebugPrefixMap;
@@ -322,6 +338,10 @@ public:
   /// Pointer authentication.
   PointerAuthOptions PointerAuth;
 
+  /// Use async-specific lowering for async functions if it is supported for
+  /// the target.
+  bool UseAsyncLowering = USE_SWIFT_ASYNC_LOWERING;
+
   /// The different modes for dumping IRGen type info.
   enum class TypeInfoDumpFilter {
     All,
@@ -342,6 +362,7 @@ public:
         Verify(true), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
+        SanitizeAddressUseODRIndicator(false),
         DebugInfoLevel(IRGenDebugInfoLevel::None),
         DebugInfoFormat(IRGenDebugInfoFormat::None),
         DisableClangModuleSkeletonCUs(false), UseJIT(false),

@@ -1,6 +1,9 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
 
+// Would fail due to unavailability of swift_autoDiffCreateLinearMapContext.
+// UNSUPPORTED: use_os_stdlib
+
 import StdlibUnittest
 import _Differentiation
 
@@ -397,7 +400,7 @@ ArrayAutoDiffTests.test("Array.append") {
 }
 
 ArrayAutoDiffTests.test("Array.init(repeating:count:)") {
-  @differentiable
+  @differentiable(reverse)
   func repeating(_ x: Float) -> [Float] {
     Array(repeating: x, count: 10)
   }
@@ -410,7 +413,7 @@ ArrayAutoDiffTests.test("Array.init(repeating:count:)") {
 }
 
 ArrayAutoDiffTests.test("Array.DifferentiableView.init") {
-  @differentiable
+  @differentiable(reverse)
   func constructView(_ x: [Float]) -> Array<Float>.DifferentiableView {
     return Array<Float>.DifferentiableView(x)
   }
@@ -422,7 +425,7 @@ ArrayAutoDiffTests.test("Array.DifferentiableView.init") {
 }
 
 ArrayAutoDiffTests.test("Array.DifferentiableView.base") {
-  @differentiable
+  @differentiable(reverse)
   func accessBase(_ x: Array<Float>.DifferentiableView) -> [Float] {
     return x.base
   }
@@ -433,12 +436,6 @@ ArrayAutoDiffTests.test("Array.DifferentiableView.base") {
   expectEqual(
     FloatArrayTan([1, 2, 3, 4]),
     backprop(FloatArrayTan([1, 2, 3, 4])))
-}
-
-ArrayAutoDiffTests.test("Array.zeroTangentVector") {
-  let count = 10
-  let array: [Float] = Array((0..<count).map(Float.init))
-  expectEqual(array.zeroTangentVector.base, Array(repeating: 0, count: count))
 }
 
 runAllTests()

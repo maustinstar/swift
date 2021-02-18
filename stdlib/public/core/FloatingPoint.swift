@@ -1229,7 +1229,7 @@ public protocol FloatingPoint: SignedNumeric, Strideable, Hashable
 
 /// The sign of a floating-point value.
 @frozen
-public enum FloatingPointSign: Int {
+public enum FloatingPointSign: Int, ConcurrentValue {
   /// The sign for a positive value.
   case plus
 
@@ -1278,7 +1278,7 @@ public enum FloatingPointSign: Int {
 
 /// The IEEE 754 floating-point classes.
 @frozen
-public enum FloatingPointClassification {
+public enum FloatingPointClassification: ConcurrentValue {
   /// A signaling NaN ("not a number").
   ///
   /// A signaling NaN sets the floating-point exception status when used in
@@ -1316,7 +1316,7 @@ public enum FloatingPointClassification {
 }
 
 /// A rule for rounding a floating-point number.
-public enum FloatingPointRoundingRule {
+public enum FloatingPointRoundingRule: ConcurrentValue {
   /// Round to the closest allowed value; if two values are equally close, the
   /// one with greater magnitude is chosen.
   ///
@@ -1894,9 +1894,9 @@ extension BinaryFloatingPoint {
     // count and significand bit count, then they must share the same encoding
     // for finite and infinite values.
     switch (Source.exponentBitCount, Source.significandBitCount) {
-#if !os(macOS) && !(os(iOS) && targetEnvironment(macCatalyst))
+#if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
     case (5, 10):
-      guard #available(iOS 14.0, watchOS 7.0, tvOS 14.0, *) else {
+      guard #available(macOS 11.0, iOS 14.0, watchOS 7.0, tvOS 14.0, *) else {
         // Convert signaling NaN to quiet NaN by multiplying by 1.
         self = Self._convert(from: value).value * 1
         break

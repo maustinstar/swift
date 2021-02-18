@@ -1,6 +1,9 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
 
+// Would fail due to unavailability of swift_autoDiffCreateLinearMapContext.
+// UNSUPPORTED: use_os_stdlib
+
 // `inout` parameter differentiation tests.
 
 import DifferentiationUnittest
@@ -71,7 +74,7 @@ extension Float {
   // Custom version of `Float.*=`, implemented using `Float.*` and mutation.
   // Verify that its generated derivative has the same behavior as the
   // registered derivative for `Float.*=`.
-  @differentiable
+  @differentiable(reverse)
   static func multiplyAssign(_ lhs: inout Float, _ rhs: Float) {
     lhs = lhs * rhs
   }
@@ -114,6 +117,15 @@ InoutParameterAutoDiffTests.test("SetAccessor") {
       get { x }
       set { x = newValue }
     }
+
+    // Computed property with explicit `@differentiable` accessors.
+    var doubled: Float {
+      @differentiable(reverse)
+      get { x + x }
+
+      @differentiable(reverse)
+      set { x = newValue / 2 }
+    }
   }
 
   // `squared` implemented using a `set` accessor.
@@ -123,14 +135,25 @@ InoutParameterAutoDiffTests.test("SetAccessor") {
     s.computed *= x
     return s.x
   }
-  expectEqual(6, gradient(at: 3, in: squared))
-  expectEqual(8, gradient(at: 4, in: squared))
+  expectEqual((9, 6), valueWithGradient(at: 3, in: squared))
+  expectEqual((16, 8), valueWithGradient(at: 4, in: squared))
+
+  // `quadrupled` implemented using a `set` accessor.
+  func quadrupled(_ x: Float) -> Float {
+    var s = S(x: 1)
+    s.doubled *= 4 * x
+    return s.x
+  }
+  print(valueWithGradient(at: 3, in: quadrupled))
+  print(valueWithGradient(at: 4, in: quadrupled))
+  expectEqual((12, 4), valueWithGradient(at: 3, in: quadrupled))
+  expectEqual((16, 4), valueWithGradient(at: 4, in: quadrupled))
 }
 
 // Test differentiation wrt `inout` parameters that have a class type.
 InoutParameterAutoDiffTests.test("InoutClassParameter") {
   class Class: Differentiable {
-    @differentiable
+    @differentiable(reverse)
     var x: Float
 
     init(_ x: Float) {
@@ -173,34 +196,34 @@ InoutParameterAutoDiffTests.test("InoutClassParameter") {
 // treated as a differentiability result.
 
 protocol SR_13305_Protocol {
-  @differentiable(wrt: x)
+  @differentiable(reverse, wrt: x)
   func method(_ x: Float, _ y: inout Float)
 
-  @differentiable(wrt: x)
+  @differentiable(reverse, wrt: x)
   func genericMethod<T: Differentiable>(_ x: T, _ y: inout T)
 }
 
 InoutParameterAutoDiffTests.test("non-wrt inout parameter") {
   struct SR_13305_Struct: SR_13305_Protocol {
-    @differentiable(wrt: x)
+    @differentiable(reverse, wrt: x)
     func method(_ x: Float, _ y: inout Float) {
       y = y * x
     }
 
-    @differentiable(wrt: x)
+    @differentiable(reverse, wrt: x)
     func genericMethod<T: Differentiable>(_ x: T, _ y: inout T) {
       y = x
     }
   }
 
-  @differentiable(wrt: x)
+  @differentiable(reverse, wrt: x)
   func foo(_ s: SR_13305_Struct, _ x: Float, _ y: Float) -> Float {
     var y = y
     s.method(x, &y)
     return y
   }
 
-  @differentiable(wrt: x)
+  @differentiable(reverse, wrt: x)
   func fooGeneric<T: SR_13305_Protocol>(_ s: T, _ x: Float, _ y: Float) -> Float {
     var y = y
     s.method(x, &y)

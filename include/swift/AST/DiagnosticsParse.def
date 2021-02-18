@@ -676,6 +676,9 @@ ERROR(sil_witness_protocol_conformance_not_found,none,
 // SIL differentiability witnesses
 ERROR(sil_diff_witness_expected_token,PointsToFirstBadToken,
       "expected '%0' in differentiability witness", (StringRef))
+ERROR(sil_diff_witness_unknown_kind,PointsToFirstBadToken,
+      "unknonwn differentiability kind '%0'; expected 'forward', 'reverse', "
+      "'normal', or 'linear'", (StringRef))
 ERROR(sil_diff_witness_serialized_declaration,none,
       "differentiability witness declaration should not be serialized", ())
 ERROR(sil_diff_witness_undefined,PointsToFirstBadToken,
@@ -731,9 +734,11 @@ ERROR(generic_non_function,PointsToFirstBadToken,
 ERROR(rethrowing_function_type,none,
       "only function declarations may be marked 'rethrows'; "
       "did you mean 'throws'?", ())
+ERROR(reasync_function_type,none,
+      "only function declarations may be marked 'reasync'; "
+      "did you mean 'async'?", ())
 ERROR(async_or_throws_in_wrong_position,none,
-      "%select{'throws'|'rethrows'|'async'}0 may only occur before '->'",
-      (unsigned))
+      "'%0' may only occur before '->'", (StringRef))
 ERROR(throw_in_function_type,none,
       "expected throwing specifier; did you mean 'throws'?", ())
 ERROR(expected_type_before_arrow,none,
@@ -746,8 +751,11 @@ ERROR(function_type_argument_label,none,
 ERROR(expected_dynamic_func_attr,none,
       "expected a dynamically_replaceable function", ())
 ERROR(async_after_throws,none,
-      "'async' must precede %select{'throws'|'rethrows'}0", (bool))
+      "%select{'async'|'reasync'}0 must precede %select{'throws'|'rethrows'}1",
+      (bool, bool))
 ERROR(async_init,none, "initializer cannot be marked 'async'", ())
+ERROR(duplicate_effects_specifier,none,
+      "'%0' has already been specified", (StringRef))
 
 // Enum Types
 ERROR(expected_expr_enum_case_raw_value,PointsToFirstBadToken,
@@ -790,6 +798,8 @@ ERROR(protocol_method_argument_init,none,
       "default argument not permitted in a protocol method", ())
 ERROR(protocol_init_argument_init,none,
       "default argument not permitted in a protocol initializer", ())
+ERROR(protocol_subscript_argument_init,none,
+      "default argument not permitted in a protocol subscript", ())
 ERROR(tuple_type_multiple_labels,none,
       "tuple element cannot have two labels", ())
 
@@ -957,7 +967,6 @@ ERROR(snake_case_deprecated,none,
       "%0 has been replaced with %1 in Swift 3",
       (StringRef, StringRef))
 
-
 // Assignment statement
 ERROR(expected_expr_assignment,none,
       "expected expression in assignment", ())
@@ -984,6 +993,10 @@ NOTE(indent_expression_to_silence,none,
 // Throw Statement
 ERROR(expected_expr_throw,PointsToFirstBadToken,
       "expected expression in 'throw' statement", ())
+
+// Await/Async
+ERROR(expected_await_not_async,none,
+      "found 'async' in expression; did you mean 'await'?", ())
 
 // Yield Statment
 ERROR(expected_expr_yield,PointsToFirstBadToken,
@@ -1036,8 +1049,6 @@ ERROR(expected_else_after_guard,PointsToFirstBadToken,
       "expected 'else' after 'guard' condition", ())
 ERROR(expected_lbrace_after_guard,PointsToFirstBadToken,
       "expected '{' after 'guard' else", ())
-ERROR(bound_var_guard_body,none,
-      "variable declared in 'guard' condition is not usable in its body", ())
 
 // While Statement
 ERROR(expected_condition_while,PointsToFirstBadToken,
@@ -1221,6 +1232,8 @@ ERROR(super_in_closure_with_capture,none,
       "not yet supported", ())
 NOTE(super_in_closure_with_capture_here,none,
      "'self' explicitly captured here", ())
+
+WARNING(await_before_try,none, "'try' must precede 'await'", ())
 
 // Tuples and parenthesized expressions
 ERROR(expected_expr_in_expr_list,none,
@@ -1483,6 +1496,14 @@ WARNING(originally_defined_in_major_minor_only,none,
 WARNING(originally_defined_in_missing_platform_name,none,
         "* as platform name has no effect", ())
 
+WARNING(originally_defined_in_swift_version, none,
+        "Swift language version checks has no effect "
+        "in @_originallyDefinedIn", ())
+
+WARNING(originally_defined_in_package_description, none,
+        "PackageDescription version checks has no effect "
+        "in @_originallyDefinedIn", ())
+
 // convention
 ERROR(convention_attribute_expected_lparen,none,
       "expected '(' after 'convention' attribute", ())
@@ -1588,14 +1609,19 @@ ERROR(attr_implements_expected_member_name,PointsToFirstBadToken,
       "expected a member name as second parameter in '_implements' attribute", ())
 
 // differentiable
+WARNING(attr_differentiable_expected_reverse,PointsToFirstBadToken,
+        "'@differentiable' has been renamed to '@differentiable(reverse)' and "
+        "will be removed in the next release", ())
+ERROR(attr_differentiable_kind_not_supported,PointsToFirstBadToken,
+      "unsupported differentiability kind '%0'; only 'reverse' is supported", (StringRef))
+ERROR(attr_differentiable_unknown_kind,PointsToFirstBadToken,
+      "unknown differentiability kind '%0'; only 'reverse' is supported", (StringRef))
 ERROR(attr_differentiable_expected_parameter_list,PointsToFirstBadToken,
       "expected a list of parameters to differentiate with respect to", ())
 ERROR(attr_differentiable_use_wrt_not_withrespectto,none,
       "use 'wrt:' to specify parameters to differentiate with respect to", ())
 ERROR(attr_differentiable_expected_label,none,
       "expected 'wrt:' or 'where' in '@differentiable' attribute", ())
-ERROR(attr_differentiable_unexpected_argument,none,
-      "unexpected argument '%0' in '@differentiable' attribute", (StringRef))
 
 // differentiation `wrt` parameters clause
 ERROR(expected_colon_after_label,PointsToFirstBadToken,

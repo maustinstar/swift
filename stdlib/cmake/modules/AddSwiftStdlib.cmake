@@ -70,6 +70,10 @@ function(_add_target_variant_c_compile_link_flags)
     endif()
   endif()
 
+  if("${CFLAGS_SDK}" STREQUAL "ANDROID")
+    set(DEPLOYMENT_VERSION ${SWIFT_ANDROID_API_LEVEL})
+  endif()
+
   # MSVC, clang-cl, gcc don't understand -target.
   if(CMAKE_C_COMPILER_ID MATCHES "^Clang|AppleClang$" AND
       NOT SWIFT_COMPILER_IS_MSVC_LIKE)
@@ -105,20 +109,6 @@ function(_add_target_variant_c_compile_link_flags)
     list(APPEND result
       "-arch" "${CFLAGS_ARCH}"
       "-F${SWIFT_SDK_${CFLAGS_SDK}_PATH}/../../../Developer/Library/Frameworks")
-
-    set(add_explicit_version TRUE)
-
-    # iOS-like and zippered libraries get their deployment version from the
-    # target triple
-    if(maccatalyst_build_flavor STREQUAL "ios-like" OR
-        maccatalyst_build_flavor STREQUAL "zippered")
-      set(add_explicit_version FALSE)
-    endif()
-
-    if(add_explicit_version)
-      list(APPEND result
-        "-m${SWIFT_SDK_${CFLAGS_SDK}_VERSION_MIN_NAME}-version-min=${DEPLOYMENT_VERSION}")
-     endif()
   endif()
 
   if(CFLAGS_ANALYZE_CODE_COVERAGE)
@@ -261,18 +251,15 @@ function(_add_target_variant_c_compile_flags)
     endif()
   endif()
 
-  if(${CFLAGS_SDK} STREQUAL ANDROID)
-    if(${CFLAGS_ARCH} STREQUAL x86_64)
-      # NOTE(compnerd) Android NDK 21 or lower will generate library calls to
-      # `__sync_val_compare_and_swap_16` rather than lowering to the CPU's
-      # `cmpxchg16b` instruction as the `cx16` feature is disabled due to a bug
-      # in Clang.  This is being fixed in the current master Clang and will
-      # hopefully make it into Clang 9.0.  In the mean time, workaround this in
-      # the build.
-      if(CMAKE_C_COMPILER_ID MATCHES Clang AND CMAKE_C_COMPILER_VERSION
-          VERSION_LESS 9.0.0)
-        list(APPEND result -mcx16)
-      endif()
+  # The concurrency library uses double-word atomics.  MSVC's std::atomic
+  # uses a spin lock for this, so to get reasonable behavior we have to
+  # implement it ourselves using _InterlockedCompareExchange128.
+  # clang-cl requires us to enable the `cx16` feature to use this intrinsic.
+  if(CFLAGS_ARCH STREQUAL x86_64)
+    if(SWIFT_COMPILER_IS_MSVC_LIKE)
+      list(APPEND result /clang:-mcx16)
+    else()
+      list(APPEND result -mcx16)
     endif()
   endif()
 
@@ -294,16 +281,6 @@ function(_add_target_variant_c_compile_flags)
   if((CFLAGS_ARCH STREQUAL "armv7" OR CFLAGS_ARCH STREQUAL "aarch64") AND
      (CFLAGS_SDK STREQUAL "LINUX" OR CFLAGS_SDK STREQUAL "ANDROID"))
      list(APPEND result -funwind-tables)
-  endif()
-
-  if("${CFLAGS_SDK}" STREQUAL "ANDROID")
-    list(APPEND result -nostdinc++)
-    swift_android_libcxx_include_paths(CFLAGS_CXX_INCLUDES)
-    swift_android_include_for_arch("${CFLAGS_ARCH}" "${CFLAGS_ARCH}_INCLUDE")
-    foreach(path IN LISTS CFLAGS_CXX_INCLUDES ${CFLAGS_ARCH}_INCLUDE)
-      list(APPEND result "SHELL:${CMAKE_INCLUDE_SYSTEM_FLAG_C}${path}")
-    endforeach()
-    list(APPEND result "-D__ANDROID_API__=${SWIFT_ANDROID_API_LEVEL}")
   endif()
 
   if("${CFLAGS_SDK}" STREQUAL "LINUX")
@@ -402,10 +379,10 @@ function(_add_target_variant_link_flags)
     list(APPEND library_search_directories
          ${CMAKE_BINARY_DIR}/winsdk_lib_${LFLAGS_ARCH}_symlinks)
   elseif("${LFLAGS_SDK}" STREQUAL "HAIKU")
-    list(APPEND link_libraries "bsd" "atomic")
+    list(APPEND link_libraries "bsd")
     list(APPEND result "-Wl,-Bsymbolic")
   elseif("${LFLAGS_SDK}" STREQUAL "ANDROID")
-    list(APPEND link_libraries "dl" "log" "atomic")
+    list(APPEND link_libraries "dl" "log")
     # We need to add the math library, which is linked implicitly by libc++
     list(APPEND result "-lm")
 
@@ -418,7 +395,7 @@ function(_add_target_variant_link_flags)
       ${SWIFT_ANDROID_${LFLAGS_ARCH}_ICU_I18N}
       ${SWIFT_ANDROID_${LFLAGS_ARCH}_ICU_UC})
 
-    swift_android_lib_for_arch(${LFLAGS_ARCH} ${LFLAGS_ARCH}_LIB)
+    swift_android_libgcc_for_arch_cross_compile(${LFLAGS_ARCH} ${LFLAGS_ARCH}_LIB)
     foreach(path IN LISTS ${LFLAGS_ARCH}_LIB)
       list(APPEND library_search_directories ${path})
     endforeach()
@@ -1291,6 +1268,10 @@ function(_add_swift_target_library_single target name)
         endif()
       endif()
     endif()
+
+    # Silence warnings about global initializers. We already have clang
+    # emitting warnings about global initializers when it compiles the code.
+    list(APPEND swiftlib_link_flags_all "-Xlinker -no_warn_inits")
   endif()
   target_link_libraries(${target} PRIVATE
     ${link_libraries})
@@ -1653,8 +1634,15 @@ function(add_swift_target_library name)
     list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS "-warn-implicit-overrides")
   endif()
 
-  if(NOT SWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER AND NOT BUILD_STANDALONE)
+  if(NOT SWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER AND NOT BUILD_STANDALONE AND
+     NOT SWIFT_PREBUILT_CLANG)
     list(APPEND SWIFTLIB_DEPENDS clang)
+  endif()
+
+  # Turn off implicit import of _Concurrency when building libraries
+  if(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
+    list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS 
+                      "-Xfrontend;-disable-implicit-concurrency-module-import")
   endif()
 
   # If we are building this library for targets, loop through the various
@@ -2024,7 +2012,9 @@ function(add_swift_target_library name)
       if(NOT SWIFTLIB_OBJECT_LIBRARY)
         # Add dependencies on the (not-yet-created) custom lipo target.
         foreach(DEP ${SWIFTLIB_LINK_LIBRARIES})
-          if (NOT "${DEP}" STREQUAL "icucore")
+          if (NOT "${DEP}" STREQUAL "icucore" AND
+              NOT "${DEP}" STREQUAL "dispatch" AND
+              NOT "${DEP}" STREQUAL "BlocksRuntime")
             add_dependencies(${VARIANT_NAME}
               "${DEP}-${SWIFT_SDK_${sdk}_LIB_SUBDIR}")
           endif()
@@ -2033,7 +2023,9 @@ function(add_swift_target_library name)
         if (SWIFTLIB_IS_STDLIB AND SWIFTLIB_STATIC)
           # Add dependencies on the (not-yet-created) custom lipo target.
           foreach(DEP ${SWIFTLIB_LINK_LIBRARIES})
-            if (NOT "${DEP}" STREQUAL "icucore")
+            if (NOT "${DEP}" STREQUAL "icucore" AND
+                NOT "${DEP}" STREQUAL "dispatch" AND
+                NOT "${DEP}" STREQUAL "BlocksRuntime")
               add_dependencies("${VARIANT_NAME}-static"
                 "${DEP}-${SWIFT_SDK_${sdk}_LIB_SUBDIR}-static")
             endif()

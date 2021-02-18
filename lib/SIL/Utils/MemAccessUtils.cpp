@@ -122,14 +122,13 @@ public:
       phiArg->getIncomingPhiValues(pointerWorklist);
   }
 
-  void visitStorageCast(SingleValueInstruction *projectedAddr,
-                        Operand *sourceOper) {
+  void visitStorageCast(SingleValueInstruction *cast, Operand *sourceOper) {
     // Allow conversions to/from pointers and addresses on disjoint phi paths
     // only if the underlying useDefVisitor allows it.
     if (storageCastTy == IgnoreStorageCast)
       pointerWorklist.push_back(sourceOper->get());
     else
-      visitNonAccess(projectedAddr);
+      visitNonAccess(cast);
   }
 
   void visitAccessProjection(SingleValueInstruction *projectedAddr,
@@ -207,8 +206,7 @@ public:
     return this->asImpl().visitNonAccess(phiArg);
   }
 
-  SILValue visitStorageCast(SingleValueInstruction *projectedAddr,
-                            Operand *sourceAddr) {
+  SILValue visitStorageCast(SingleValueInstruction *, Operand *sourceAddr) {
     assert(storageCastTy == IgnoreStorageCast);
     return sourceAddr->get();
   }
@@ -303,12 +301,11 @@ public:
   }
 
   // Override visitStorageCast to avoid seeing through arbitrary address casts.
-  SILValue visitStorageCast(SingleValueInstruction *projectedAddr,
-                            Operand *sourceAddr) {
+  SILValue visitStorageCast(SingleValueInstruction *cast, Operand *sourceAddr) {
     if (storageCastTy == StopAtStorageCast)
-      return visitNonAccess(projectedAddr);
+      return visitNonAccess(cast);
 
-    return SuperTy::visitStorageCast(projectedAddr, sourceAddr);
+    return SuperTy::visitStorageCast(cast, sourceAddr);
   }
 };
 
@@ -372,8 +369,9 @@ bool swift::isLetAddress(SILValue address) {
 // RC-identical would confuse ARC optimization, which might eliminate a retain
 // of such an object completely.
 //
-// The SILVerifier checks that none of these operations cast a nontrivial value
-// to a reference except unconditional_checked_cast[_value].
+// The SILVerifier checks that none of these operations cast a trivial value to
+// a reference except unconditional_checked_cast[_value], which is checked By
+// SILDynamicCastInst::isRCIdentityPreserving().
 bool swift::isRCIdentityPreservingCast(SingleValueInstruction *svi) {
   switch (svi->getKind()) {
   default:
@@ -765,6 +763,13 @@ AccessedStorage AccessedStorage::computeInScope(SILValue sourceAddress) {
 //                              MARK: AccessPath
 //===----------------------------------------------------------------------===//
 
+AccessPath AccessPath::forTailStorage(SILValue rootReference) {
+  return AccessPath(
+    AccessedStorage::forClass(rootReference, AccessedStorage::TailIndex),
+    PathNode(rootReference->getModule()->getIndexTrieRoot()),
+    /*offset*/ 0);
+}
+
 bool AccessPath::contains(AccessPath subPath) const {
   if (!isValid() || !subPath.isValid()) {
     return false;
@@ -927,6 +932,7 @@ public:
       // Ignore everything in getAccessProjectionOperand that is an access
       // projection with no affect on the access path.
       assert(isa<OpenExistentialAddrInst>(projectedAddr)
+             || isa<InitEnumDataAddrInst>(projectedAddr)
              || isa<UncheckedTakeEnumDataAddrInst>(projectedAddr)
              || isa<ProjectBoxInst>(projectedAddr));
     }
@@ -1390,6 +1396,10 @@ AccessPathDefUseTraversal::visitSingleValueUser(SingleValueInstruction *svi,
     return IgnoredUse;
   }
 
+  case SILInstructionKind::InitEnumDataAddrInst:
+    pushUsers(svi, dfs);
+    return IgnoredUse;
+
   // open_existential_addr and unchecked_take_enum_data_addr are classified as
   // access projections, but they also modify memory. Both see through them and
   // also report them as uses.
@@ -1437,6 +1447,9 @@ bool AccessPathDefUseTraversal::visitUser(DFSEntry dfs) {
       return true;
     }
   }
+  if (isa<EndBorrowInst>(use->getUser())) {
+    return true;
+  }
   // We weren't able to "see through" any more address conversions; so
   // record this as a use.
 
@@ -1479,7 +1492,7 @@ public:
     : AccessUseVisitor(useTy, NestedAccessType::IgnoreAccessBegin), uses(uses),
       useLimit(useLimit) {}
 
-  bool visitUse(Operand *use, AccessUseType useTy) {
+  bool visitUse(Operand *use, AccessUseType useTy) override {
     if (uses.size() == useLimit) {
       return false;
     }
@@ -1800,6 +1813,12 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
     case BuiltinValueKind::IntInstrprofIncrement:
     case BuiltinValueKind::TSanInoutAccess:
     case BuiltinValueKind::CancelAsyncTask:
+    case BuiltinValueKind::CreateAsyncTask:
+    case BuiltinValueKind::CreateAsyncTaskFuture:
+    case BuiltinValueKind::AutoDiffCreateLinearMapContext:
+    case BuiltinValueKind::AutoDiffAllocateSubcontext:
+    case BuiltinValueKind::InitializeDefaultActor:
+    case BuiltinValueKind::DestroyDefaultActor:
       return;
 
     // General memory access to a pointer in first operand position.
@@ -1958,6 +1977,7 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::ExistentialMetatypeInst:
   case SILInstructionKind::FixLifetimeInst:
   case SILInstructionKind::GlobalAddrInst:
+  case SILInstructionKind::HopToExecutorInst:
   case SILInstructionKind::InitExistentialValueInst:
   case SILInstructionKind::IsUniqueInst:
   case SILInstructionKind::IsEscapingClosureInst:
@@ -1974,6 +1994,10 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::UnconditionalCheckedCastAddrInst:
   case SILInstructionKind::UnconditionalCheckedCastValueInst:
   case SILInstructionKind::ValueMetatypeInst:
+  // TODO: Is this correct?
+  case SILInstructionKind::GetAsyncContinuationInst:
+  case SILInstructionKind::GetAsyncContinuationAddrInst:
+  case SILInstructionKind::AwaitAsyncContinuationInst:
     return;
   }
 }

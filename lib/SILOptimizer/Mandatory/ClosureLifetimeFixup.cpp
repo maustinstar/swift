@@ -12,11 +12,13 @@
 
 #define DEBUG_TYPE "closure-lifetime-fixup"
 
+#include "swift/Basic/Defer.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
@@ -101,22 +103,16 @@ static SILInstruction *getDeinitSafeClosureDestructionPoint(SILBasicBlock *bb) {
 
 static void findReachableExitBlocks(SILInstruction *i,
                                     SmallVectorImpl<SILBasicBlock *> &result) {
-  SmallVector<SILBasicBlock *, 32> worklist;
-  SmallPtrSet<SILBasicBlock *, 8> visitedBlocks;
+  BasicBlockWorklist<32> worklist(i->getParent());
 
-  visitedBlocks.insert(i->getParent());
-  worklist.push_back(i->getParent());
-
-  while (!worklist.empty()) {
-    auto *bb = worklist.pop_back_val();
+  while (SILBasicBlock *bb = worklist.pop()) {
     if (bb->getTerminator()->isFunctionExiting()) {
       result.push_back(bb);
       continue;
     }
-    llvm::copy_if(bb->getSuccessorBlocks(), std::back_inserter(worklist),
-                  [&](SILBasicBlock *bb) {
-      return visitedBlocks.insert(bb).second;
-    });
+    for (SILBasicBlock *succ : bb->getSuccessors()) {
+      worklist.pushIfNotVisited(succ);
+    }
   }
 }
 
@@ -244,7 +240,9 @@ static void extendLifetimeToEndOfFunction(SILFunction &fn,
   // lifetime respecting loops.
   SmallVector<SILPhiArgument *, 8> insertedPhis;
   SILSSAUpdater updater(&insertedPhis);
-  updater.initialize(optionalEscapingClosureTy);
+  updater.initialize(optionalEscapingClosureTy, fn.hasOwnership()
+                                                    ? OwnershipKind::Owned
+                                                    : OwnershipKind::None);
 
   // Create an Optional<() -> ()>.none in the entry block of the function and
   // add it as an available value to the SSAUpdater.
@@ -849,7 +847,9 @@ static bool fixupCopyBlockWithoutEscaping(CopyBlockWithoutEscapingInst *cb,
 
   SmallVector<SILPhiArgument *, 8> insertedPhis;
   SILSSAUpdater updater(&insertedPhis);
-  updater.initialize(optionalEscapingClosureTy);
+  updater.initialize(optionalEscapingClosureTy, fn.hasOwnership()
+                                                    ? OwnershipKind::Owned
+                                                    : OwnershipKind::None);
 
   // Create the Optional.none as the beginning available value.
   SILValue entryBlockOptionalNone;
@@ -1002,9 +1002,8 @@ class ClosureLifetimeFixup : public SILFunctionTransform {
 
     if (fixupClosureLifetimes(*getFunction(), checkStackNesting, modifiedCFG)) {
       if (checkStackNesting){
-        StackNesting sn;
         modifiedCFG |=
-            sn.correctStackNesting(getFunction()) == StackNesting::Changes::CFG;
+          StackNesting::fixNesting(getFunction()) == StackNesting::Changes::CFG;
       }
       if (modifiedCFG)
         invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);

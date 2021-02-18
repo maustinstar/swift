@@ -120,7 +120,6 @@ struct CodeCompletionInfo {
   struct DescriptionStructure {
     IndexRange baseName;
     IndexRange parameterRange;
-    IndexRange throwsRange;
   };
 
   Optional<DescriptionStructure> descriptionStructure;
@@ -231,8 +230,6 @@ enum class SyntaxTreeTransferMode {
   /// Always transfer the entire syntax tree
   Full
 };
-
-enum class SyntaxTreeSerializationFormat { JSON, ByteTree };
 
 class EditorConsumer {
   virtual void anchor();
@@ -379,6 +376,12 @@ struct RefactoringInfo {
   StringRef UnavailableReason;
 };
 
+struct ParentInfo {
+  StringRef Title;
+  StringRef KindName;
+  StringRef USR;
+};
+
 struct CursorInfoData {
   // If nonempty, a proper Info could not be resolved (and the rest of the Info
   // will be empty). Clients can potentially use this to show a diagnostic
@@ -402,6 +405,8 @@ struct CursorInfoData {
   /// Fully annotated XML pretty printed declaration.
   /// FIXME: this should eventually replace \c AnnotatedDeclaration.
   StringRef FullyAnnotatedDeclaration;
+  /// The SymbolGraph JSON for this declaration.
+  StringRef SymbolGraph;
   /// Non-empty if the symbol was imported from a clang module.
   StringRef ModuleName;
   /// Non-empty if a generated interface editor document has previously been
@@ -420,6 +425,10 @@ struct CursorInfoData {
   ArrayRef<StringRef> ModuleGroupArray;
   /// All available actions on the code under cursor.
   ArrayRef<RefactoringInfo> AvailableActions;
+  /// Stores the Symbol Graph title, kind, and USR of the parent contexts of the
+  /// symbol under the cursor.
+  ArrayRef<ParentInfo> ParentContexts;
+
   bool IsSystem = false;
   llvm::Optional<unsigned> ParentNameOffset;
 };
@@ -496,6 +505,7 @@ struct DocEntityInfo {
   bool IsUnavailable = false;
   bool IsDeprecated = false;
   bool IsOptional = false;
+  bool IsAsync = false;
   swift::Type Ty;
 };
 
@@ -659,6 +669,8 @@ public:
 
   virtual void globalConfigurationUpdated(std::shared_ptr<GlobalConfig> Config) {};
 
+  virtual void dependencyUpdated() {}
+
   virtual void indexSource(StringRef Filename,
                            IndexingConsumer &Consumer,
                            ArrayRef<const char *> Args) = 0;
@@ -745,8 +757,9 @@ public:
 
   virtual void
   getCursorInfo(StringRef Filename, unsigned Offset, unsigned Length,
-                bool Actionables, bool CancelOnSubsequentRequest,
-                ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
+                bool Actionables, bool SymbolGraph,
+                bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
+                Optional<VFSOptions> vfsOptions,
        std::function<void(const RequestResult<CursorInfoData> &)> Receiver) = 0;
 
   virtual void getNameInfo(StringRef Filename, unsigned Offset,

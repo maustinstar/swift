@@ -114,7 +114,7 @@ convertObjectToLoadableBridgeableType(SILBuilderWithScope &builder,
 
   SILBasicBlock *castSuccessBB =
       f->createBasicBlockAfter(dynamicCast.getInstruction()->getParent());
-  castSuccessBB->createPhiArgument(silBridgedTy, ValueOwnershipKind::Owned);
+  castSuccessBB->createPhiArgument(silBridgedTy, OwnershipKind::Owned);
 
   // If we /are/ conditional and we do not need to bridge the load to the sil,
   // then we just create our cast success block and branch from the end of the
@@ -123,7 +123,7 @@ convertObjectToLoadableBridgeableType(SILBuilderWithScope &builder,
   // insert the bridge call/switch there. We return the argument of the cast
   // success block as the value to be passed to the bridging function.
   if (load->getType() == silBridgedTy) {
-    castSuccessBB->moveAfter(dynamicCast.getInstruction()->getParent());
+    f->moveBlockAfter(castSuccessBB, dynamicCast.getInstruction()->getParent());
     builder.createBranch(loc, castSuccessBB, load);
     builder.setInsertionPoint(castSuccessBB);
     return {castSuccessBB->getArgument(0), nullptr};
@@ -138,7 +138,7 @@ convertObjectToLoadableBridgeableType(SILBuilderWithScope &builder,
 
   // Now that we have created the failure bb, move our cast success block right
   // after the checked_cast_br bb.
-  castSuccessBB->moveAfter(dynamicCast.getInstruction()->getParent());
+  f->moveBlockAfter(castSuccessBB, dynamicCast.getInstruction()->getParent());
 
   // Ok, we need to perform the full cast optimization. This means that we are
   // going to replace the cast terminator in inst_block with a checked_cast_br.
@@ -155,8 +155,8 @@ convertObjectToLoadableBridgeableType(SILBuilderWithScope &builder,
     auto *newFailureBlock = ccbi->getFailureBB();
     SILValue defaultArg;
     if (builder.hasOwnership()) {
-      defaultArg = newFailureBlock->createPhiArgument(
-          load->getType(), ValueOwnershipKind::Owned);
+      defaultArg = newFailureBlock->createPhiArgument(load->getType(),
+                                                      OwnershipKind::Owned);
     } else {
       defaultArg = ccbi->getOperand();
     }
@@ -574,14 +574,14 @@ static SILValue computeFinalCastedValue(SILBuilderWithScope &builder,
         if (!innerBuilder.hasOwnership())
           return newAI;
         return failureBB->createPhiArgument(newAI->getType(),
-                                            ValueOwnershipKind::Owned);
+                                            OwnershipKind::Owned);
       }());
       innerBuilder.emitDestroyOperation(loc, valueToDestroy);
     }
 
     auto *condBrSuccessBB =
         newAI->getFunction()->createBasicBlockAfter(newAI->getParent());
-    condBrSuccessBB->createPhiArgument(destLoweredTy, ValueOwnershipKind::Owned);
+    condBrSuccessBB->createPhiArgument(destLoweredTy, OwnershipKind::Owned);
     builder.createCheckedCastBranch(loc, /* isExact*/ false, newAI,
                                     destLoweredTy, destFormalTy,
                                     condBrSuccessBB, failureBB);
@@ -1177,6 +1177,11 @@ SILInstruction *CastOptimizer::optimizeCheckedCastAddrBranchInst(
       if (isa<DeallocStackInst>(User) || User == Inst)
         continue;
       if (auto *SI = dyn_cast<StoreInst>(User)) {
+        if (SI->getOwnershipQualifier() == StoreOwnershipQualifier::Assign) {
+          // We do not handle [assign]
+          isLegal = false;
+          break;
+        }
         if (!Store) {
           Store = SI;
           continue;
@@ -1210,11 +1215,13 @@ SILInstruction *CastOptimizer::optimizeCheckedCastAddrBranchInst(
               SuccessBB, FailureBB, Inst->getTrueBBCount(),
               Inst->getFalseBBCount());
           SuccessBB->createPhiArgument(Dest->getType().getObjectType(),
-                                       ValueOwnershipKind::Owned);
+                                       OwnershipKind::Owned);
           B.setInsertionPoint(SuccessBB->begin());
           // Store the result
-          B.createStore(Loc, SuccessBB->getArgument(0), Dest,
-                        StoreOwnershipQualifier::Unqualified);
+          B.emitStoreValueOperation(Loc, SuccessBB->getArgument(0), Dest,
+                                    StoreOwnershipQualifier::Trivial);
+          if (B.hasOwnership())
+            FailureBB->createPhiArgument(MI->getType(), OwnershipKind::None);
           eraseInstAction(Inst);
           return NewI;
         }
@@ -1247,7 +1254,7 @@ CastOptimizer::optimizeCheckedCastBranchInst(CheckedCastBranchInst *Inst) {
     auto *fBlock = dynamicCast.getFailureBlock();
     if (B.hasOwnership()) {
       fBlock->replacePhiArgumentAndReplaceAllUses(0, mi->getType(),
-                                                  ValueOwnershipKind::None);
+                                                  OwnershipKind::None);
     }
     return B.createCheckedCastBranch(
         dynamicCast.getLocation(), false /*isExact*/, mi,

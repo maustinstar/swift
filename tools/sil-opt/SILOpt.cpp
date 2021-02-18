@@ -112,11 +112,11 @@ EnableSpeculativeDevirtualization("enable-spec-devirt",
                   llvm::cl::desc("Enable Speculative Devirtualization pass."));
 
 namespace {
-enum EnforceExclusivityMode {
+enum class EnforceExclusivityMode {
   Unchecked, // static only
   Checked,   // static and dynamic
   DynamicOnly,
-  None
+  None,
 };
 } // end anonymous namespace
 
@@ -180,11 +180,34 @@ static llvm::cl::opt<int>
 SILInlineThreshold("sil-inline-threshold", llvm::cl::Hidden,
                    llvm::cl::init(-1));
 
+// Legacy option name still in use. The frontend uses -sil-verify-all.
 static llvm::cl::opt<bool>
 EnableSILVerifyAll("enable-sil-verify-all",
                    llvm::cl::Hidden,
                    llvm::cl::init(true),
                    llvm::cl::desc("Run sil verifications after every pass."));
+
+static llvm::cl::opt<bool>
+SILVerifyAll("sil-verify-all",
+             llvm::cl::Hidden,
+             llvm::cl::init(true),
+             llvm::cl::desc("Run sil verifications after every pass."));
+
+static llvm::cl::opt<bool>
+SILVerifyNone("sil-verify-none",
+              llvm::cl::Hidden,
+              llvm::cl::init(false),
+              llvm::cl::desc("Completely disable SIL verification"));
+
+/// Customize the default behavior
+static llvm::cl::opt<bool> EnableASTVerifier(
+    "enable-ast-verifier", llvm::cl::Hidden, llvm::cl::init(false),
+    llvm::cl::desc("Override the default behavior and Enable the ASTVerifier"));
+
+static llvm::cl::opt<bool> DisableASTVerifier(
+    "disable-ast-verifier", llvm::cl::Hidden, llvm::cl::init(false),
+    llvm::cl::desc(
+        "Override the default behavior and force disable the ASTVerifier"));
 
 static llvm::cl::opt<bool>
 RemoveRuntimeAsserts("remove-runtime-asserts",
@@ -293,6 +316,22 @@ static void runCommandLineSelectedPasses(SILModule *Module,
     Module->verify();
 }
 
+namespace {
+using ASTVerifierOverrideKind = LangOptions::ASTVerifierOverrideKind;
+} // end anonymous namespace
+
+static Optional<ASTVerifierOverrideKind> getASTOverrideKind() {
+  assert(!(EnableASTVerifier && DisableASTVerifier) &&
+         "Can only set one of EnableASTVerifier/DisableASTVerifier?!");
+  if (EnableASTVerifier)
+    return ASTVerifierOverrideKind::EnableVerifier;
+
+  if (DisableASTVerifier)
+    return ASTVerifierOverrideKind::DisableVerifier;
+
+  return None;
+}
+
 // This function isn't referenced outside its translation unit, but it
 // can't use the "static" keyword because its address is used for
 // getMainExecutable (since some platforms don't support taking the
@@ -342,11 +381,12 @@ int main(int argc, char **argv) {
   // cache.
   Invocation.getClangImporterOptions().ModuleCachePath = ModuleCachePath;
   Invocation.setParseStdlib();
-  Invocation.getLangOptions().DisableParserLookup = true;
   Invocation.getLangOptions().DisableAvailabilityChecking = true;
   Invocation.getLangOptions().EnableAccessControl = false;
   Invocation.getLangOptions().EnableObjCAttrRequiresFoundation = false;
-  
+  if (auto overrideKind = getASTOverrideKind()) {
+    Invocation.getLangOptions().ASTVerifierOverride = *overrideKind;
+  }
   Invocation.getLangOptions().EnableExperimentalConcurrency =
     EnableExperimentalConcurrency;
 
@@ -375,7 +415,8 @@ int main(int argc, char **argv) {
   // Setup the SIL Options.
   SILOptions &SILOpts = Invocation.getSILOptions();
   SILOpts.InlineThreshold = SILInlineThreshold;
-  SILOpts.VerifyAll = EnableSILVerifyAll;
+  SILOpts.VerifyAll = SILVerifyAll || EnableSILVerifyAll;
+  SILOpts.VerifyNone = SILVerifyNone;
   SILOpts.RemoveRuntimeAsserts = RemoveRuntimeAsserts;
   SILOpts.AssertConfig = AssertConfId;
   if (OptimizationGroup != OptGroup::Diagnostics)

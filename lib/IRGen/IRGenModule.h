@@ -723,15 +723,21 @@ public:
       *DynamicReplacementLinkEntryPtrTy; // %link_entry*
   llvm::StructType *DynamicReplacementKeyTy; // { i32, i32}
 
+  llvm::StructType *AsyncFunctionPointerTy; // { i32, i32 }
   llvm::StructType *SwiftContextTy;
   llvm::StructType *SwiftTaskTy;
+  llvm::StructType *SwiftJobTy;
   llvm::StructType *SwiftExecutorTy;
+  llvm::PointerType *AsyncFunctionPointerPtrTy;
   llvm::PointerType *SwiftContextPtrTy;
   llvm::PointerType *SwiftTaskPtrTy;
+  llvm::PointerType *SwiftJobPtrTy;
   llvm::PointerType *SwiftExecutorPtrTy;
   llvm::FunctionType *TaskContinuationFunctionTy;
   llvm::PointerType *TaskContinuationFunctionPtrTy;
-
+  llvm::StructType *AsyncTaskAndContextTy;
+  llvm::StructType *AsyncContinuationContextTy;
+  llvm::PointerType *AsyncContinuationContextPtrTy;
   llvm::StructType *DifferentiabilityWitnessTy; // { i8*, i8* }
 
   llvm::GlobalVariable *TheTrivialPropertyDescriptor = nullptr;
@@ -904,6 +910,7 @@ public:
   const LoadableTypeInfo &getUnknownObjectTypeInfo();
   const LoadableTypeInfo &getBridgeObjectTypeInfo();
   const LoadableTypeInfo &getRawPointerTypeInfo();
+  const LoadableTypeInfo &getRawUnsafeContinuationTypeInfo();
   llvm::Type *getStorageTypeForUnlowered(Type T);
   llvm::Type *getStorageTypeForLowered(CanType T);
   llvm::Type *getStorageType(SILType T);
@@ -964,9 +971,6 @@ private:
   friend TypeConverter;
 
   const clang::ASTContext *ClangASTContext;
-  ClangTypeConverter *ClangTypes;
-  void initClangTypeConverter();
-  void destroyClangTypeConverter();
 
   llvm::DenseMap<Decl*, MetadataLayout*> MetadataLayouts;
   void destroyMetadataLayoutMap();
@@ -1058,10 +1062,10 @@ public:
                               SILType objectType, const TypeInfo &objectTI,
                               const OutliningMetadataCollector &collector);
 
-private:
   llvm::Constant *getAddrOfClangGlobalDecl(clang::GlobalDecl global,
                                            ForDefinition_t forDefinition);
 
+private:
   using CopyAddrHelperGenerator =
     llvm::function_ref<void(IRGenFunction &IGF, Address dest, Address src,
                             SILType objectType, const TypeInfo &objectTI)>;
@@ -1281,6 +1285,7 @@ public:
   llvm::InlineAsm *getObjCRetainAutoreleasedReturnValueMarker();
   ClassDecl *getObjCRuntimeBaseForSwiftRootClass(ClassDecl *theClass);
   ClassDecl *getObjCRuntimeBaseClass(Identifier name, Identifier objcName);
+  ClassDecl *getSwiftNativeNSObjectDecl();
   llvm::Module *getModule() const;
   llvm::AttributeList getAllocAttrs();
 
@@ -1390,6 +1395,12 @@ public:
 
   /// Cast the given constant to i8*.
   llvm::Constant *getOpaquePtr(llvm::Constant *pointer);
+
+  llvm::Constant *getAddrOfAsyncFunctionPointer(LinkEntity entity);
+  llvm::Constant *getAddrOfAsyncFunctionPointer(SILFunction *function);
+  llvm::Constant *defineAsyncFunctionPointer(LinkEntity entity,
+                                             ConstantInit init);
+  SILFunction *getSILFunctionForAsyncFunctionPointer(llvm::Constant *afp);
 
   llvm::Function *getAddrOfDispatchThunk(SILDeclRef declRef,
                                          ForDefinition_t forDefinition);
@@ -1610,6 +1621,9 @@ public:
   /// Add the swiftself attribute.
   void addSwiftSelfAttributes(llvm::AttributeList &attrs, unsigned argIndex);
 
+  void addSwiftAsyncContextAttributes(llvm::AttributeList &attrs,
+                                      unsigned argIndex);
+
   /// Add the swifterror attribute.
   void addSwiftErrorAttributes(llvm::AttributeList &attrs, unsigned argIndex);
 
@@ -1632,7 +1646,7 @@ public:
   bool hasObjCResilientClassStub(ClassDecl *D);
 
   /// Emit a resilient class stub.
-  void emitObjCResilientClassStub(ClassDecl *D);
+  llvm::Constant *emitObjCResilientClassStub(ClassDecl *D, bool isPublic);
 
 private:
   llvm::Constant *

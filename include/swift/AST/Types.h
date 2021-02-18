@@ -315,8 +315,8 @@ class alignas(1 << TypeAlignInBits) TypeBase {
   }
 
 protected:
-  enum { NumAFTExtInfoBits = 9 };
-  enum { NumSILExtInfoBits = 9 };
+  enum { NumAFTExtInfoBits = 11 };
+  enum { NumSILExtInfoBits = 11 };
   union { uint64_t OpaqueBits;
 
   SWIFT_INLINE_BITFIELD_BASE(TypeBase, bitmax(NumTypeKindBits,8) +
@@ -632,7 +632,7 @@ public:
   ///
   /// \param typeVariables This vector is populated with the set of
   /// type variables referenced by this type.
-  void getTypeVariables(SmallVectorImpl<TypeVariableType *> &typeVariables);
+  void getTypeVariables(SmallPtrSetImpl<TypeVariableType *> &typeVariables);
 
   /// Determine whether this type is a type parameter, which is either a
   /// GenericTypeParamType or a DependentMemberType.
@@ -1390,6 +1390,51 @@ public:
   }
 };
 DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinRawPointerType, BuiltinType);
+
+/// BuiltinRawContinuationType - The builtin raw unsafe continuation type.
+/// In C, this is a non-null AsyncTask*.  This pointer is completely
+/// unmanaged (the unresumed task is self-owning), but has more spare bits
+/// than Builtin.RawPointer.
+class BuiltinRawUnsafeContinuationType : public BuiltinType {
+  friend class ASTContext;
+  BuiltinRawUnsafeContinuationType(const ASTContext &C)
+    : BuiltinType(TypeKind::BuiltinRawUnsafeContinuation, C) {}
+public:
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::BuiltinRawUnsafeContinuation;
+  }
+};
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinRawUnsafeContinuationType, BuiltinType);
+
+/// BuiltinJobType - The builtin job type.  In C, this is a
+/// non-null Job*.  This pointer is completely unmanaged (the unscheduled
+/// job is self-owning), but has more spare bits than Builtin.RawPointer.
+class BuiltinJobType : public BuiltinType {
+  friend class ASTContext;
+  BuiltinJobType(const ASTContext &C)
+    : BuiltinType(TypeKind::BuiltinJob, C) {}
+public:
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::BuiltinJob;
+  }
+};
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinJobType, BuiltinType);
+
+/// BuiltinDefaultActorStorageType - The type of the stored property
+/// that's added implicitly to default actors.  No C equivalent because
+/// the C types all include a heap-object header.  Similarly, this type
+/// generally does not appear in the AST/SIL around default actors;
+/// it's purely a convenience in IRGen.
+class BuiltinDefaultActorStorageType : public BuiltinType {
+  friend class ASTContext;
+  BuiltinDefaultActorStorageType(const ASTContext &C)
+    : BuiltinType(TypeKind::BuiltinDefaultActorStorage, C) {}
+public:
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::BuiltinDefaultActorStorage;
+  }
+};
+DEFINE_EMPTY_CAN_TYPE_WRAPPER(BuiltinDefaultActorStorageType, BuiltinType);
 
 /// BuiltinNativeObjectType - The builtin opaque object-pointer type.
 /// Useful for keeping an object alive when it is otherwise being
@@ -3094,10 +3139,17 @@ public:
 
   AnyFunctionType *getWithoutDifferentiability() const;
 
+  /// Return the function type without the throwing.
+  AnyFunctionType *getWithoutThrowing() const;
+
   /// True if the parameter declaration it is attached to is guaranteed
   /// to not persist the closure for longer than the duration of the call.
   bool isNoEscape() const {
     return getExtInfo().isNoEscape();
+  }
+
+  bool isConcurrent() const {
+    return getExtInfo().isConcurrent();
   }
 
   bool isAsync() const { return getExtInfo().isAsync(); }
@@ -4071,6 +4123,7 @@ public:
     return SILCoroutineKind(Bits.SILFunctionType.CoroutineKind);
   }
 
+  bool isConcurrent() const { return getExtInfo().isConcurrent(); }
   bool isAsync() const { return getExtInfo().isAsync(); }
 
   /// Return the array of all the yields.
@@ -4332,21 +4385,18 @@ public:
 
   bool hasSameExtInfoAs(const SILFunctionType *otherFn);
 
-  /// Given that `this` is a `@differentiable` or `@differentiable(linear)`
-  /// function type, returns an `IndexSubset` corresponding to the
-  /// differentiability/linearity parameters (e.g. all parameters except the
-  /// `@noDerivative` ones).
+  /// Given that `this` is a `@differentiable` function type, returns an
+  /// `IndexSubset` corresponding to the differentiability parameters
+  /// (e.g. all parameters except the `@noDerivative` ones).
   IndexSubset *getDifferentiabilityParameterIndices();
 
-  /// Given that `this` is a `@differentiable` or `@differentiable(linear)`
-  /// function type, returns an `IndexSubset` corresponding to the
-  /// differentiability/linearity results (e.g. all results except the
-  /// `@noDerivative` ones).
+  /// Given that `this` is a `@differentiable` function type, returns an
+  /// `IndexSubset` corresponding to the differentiability results
+  /// (e.g. all results except the `@noDerivative` ones).
   IndexSubset *getDifferentiabilityResultIndices();
 
-  /// Returns the `@differentiable` or `@differentiable(linear)` function type
-  /// for the given differentiability kind and differentiability/linearity
-  /// parameter/result indices.
+  /// Returns the `@differentiable` function type for the given
+  /// differentiability kind and differentiability parameter/result indices.
   CanSILFunctionType getWithDifferentiability(DifferentiabilityKind kind,
                                               IndexSubset *parameterIndices,
                                               IndexSubset *resultIndices);
@@ -5609,8 +5659,7 @@ public:
   }
 };
 BEGIN_CAN_TYPE_WRAPPER(DependentMemberType, Type)
-  static CanDependentMemberType get(CanType base, AssociatedTypeDecl *assocType,
-                                    const ASTContext &C) {
+  static CanDependentMemberType get(CanType base, AssociatedTypeDecl *assocType) {
     return CanDependentMemberType(DependentMemberType::get(base, assocType));
   }
 

@@ -29,7 +29,8 @@ class S {
   init()
 }
 
-// CHECK-LL: define hidden swiftcc void @classinstanceSInt64ToVoid(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* {{%[0-9]+}}) {{#[0-9]+}} {
+// CHECK-LL: @classinstanceSInt64ToVoidTu =
+// CHECK-LL: define hidden swiftcc void @classinstanceSInt64ToVoid(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* swiftasync {{%[0-9]+}}) {{#[0-9]+}} {
 sil hidden @classinstanceSInt64ToVoid : $@async @convention(method) (Int64, @guaranteed S) -> () {
 bb0(%int : $Int64, %instance : $S):
   %take_s = function_ref @take_S : $@async @convention(thin) (@guaranteed S) -> ()
@@ -85,9 +86,7 @@ sil_vtable S {
   #S.deinit!deallocator: @S_deallocating_deinit
 }
 
-sil @main : $@async @convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
-bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
-
+sil @test_case : $@convention(thin) @async () -> () {
   %s_type = metatype $@thick S.Type
   %allocating_init = function_ref @S_allocating_init : $@convention(method) (@thick S.Type) -> @owned S
   %instance = apply %allocating_init(%s_type) : $@convention(method) (@thick S.Type) -> @owned S
@@ -98,10 +97,22 @@ bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>
   %result = apply %classinstanceSInt64ToVoid(%int, %instance) : $@convention(method) @async (Int64, @guaranteed S) -> () // CHECK: main.S
   strong_release %instance : $S
 
-  %2 = integer_literal $Builtin.Int32, 0
-  %3 = struct $Int32 (%2 : $Builtin.Int32)
-  return %3 : $Int32                              // id: %4
+  %void = tuple()
+  return %void : $()
 }
 
+// Defined in _Concurrency
+sil @$s12_Concurrency13_runAsyncMainyyyyYKcF : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
 
-
+// main
+sil @main : $@convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
+bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
+  %test_case_nothrow = function_ref @test_case : $@convention(thin) @async () -> ()
+  %test_case = convert_function %test_case_nothrow : $@convention(thin) @async () -> () to $@convention(thin) @async () -> @error Error
+  %thick_test_case = thin_to_thick_function %test_case : $@convention(thin) @async () -> @error Error to $@callee_guaranteed @async () -> @error Error
+  %runAsyncMain = function_ref @$s12_Concurrency13_runAsyncMainyyyyYKcF : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
+  %result = apply %runAsyncMain(%thick_test_case) : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
+  %out_literal = integer_literal $Builtin.Int32, 0
+  %out = struct $Int32 (%out_literal : $Builtin.Int32)
+  return %out : $Int32
+}

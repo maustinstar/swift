@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -disable-parser-lookup
+// RUN: %target-typecheck-verify-swift
 
 var func6 : (_ fn : (Int,Int) -> Int) -> ()
 var func6a : ((Int, Int) -> Int) -> ()
@@ -145,6 +145,7 @@ func anonymousClosureArgsInClosureWithArgs() {
 
 func doStuff(_ fn : @escaping () -> Int) {}
 func doVoidStuff(_ fn : @escaping () -> ()) {}
+func doVoidStuffNonEscaping(_ fn: () -> ()) {}
 
 // <rdar://problem/16193162> Require specifying self for locations in code where strong reference cycles are likely
 class ExplicitSelfRequiredTest {
@@ -480,4 +481,76 @@ func rdar65155671(x: Int) {
     { a in
       _ = { [a] in a }
     }(x)
+}
+
+func sr3186<T, U>(_ f: (@escaping (@escaping (T) -> U) -> ((T) -> U))) -> ((T) -> U) {
+    return { x in return f(sr3186(f))(x) }
+}
+
+class SR3186 {
+  init() {
+    // expected-warning@+1{{capture 'self' was never used}}
+    let v = sr3186 { f in { [unowned self, f] x in x != 1000 ? f(x + 1) : "success" } }(0)
+    print("\(v)")
+  }
+}
+
+// Apply the explicit 'self' rule even if it referrs to a capture, if
+// we're inside a nested closure
+class SR14120 {
+  func operation() {}
+
+  func test1() {
+    doVoidStuff { [self] in
+      operation()
+    }
+  }
+
+  func test2() {
+    doVoidStuff { [self] in
+      doVoidStuff {
+        // expected-error@+3 {{call to method 'operation' in closure requires explicit use of 'self'}}
+        // expected-note@-2 {{capture 'self' explicitly to enable implicit 'self' in this closure}}
+        // expected-note@+1 {{reference 'self.' explicitly}}
+        operation()
+      }
+    }
+  }
+
+  func test3() {
+    doVoidStuff { [self] in
+      doVoidStuff { [self] in
+        operation()
+      }
+    }
+  }
+
+  func test4() {
+    doVoidStuff { [self] in
+      doVoidStuff {
+        self.operation()
+      }
+    }
+  }
+
+  func test5() {
+    doVoidStuff { [self] in
+      doVoidStuffNonEscaping {
+        operation()
+      }
+    }
+  }
+
+  func test6() {
+    doVoidStuff { [self] in
+      doVoidStuff { [self] in
+        doVoidStuff {
+          // expected-error@+3 {{call to method 'operation' in closure requires explicit use of 'self'}}
+          // expected-note@-2 {{capture 'self' explicitly to enable implicit 'self' in this closure}}
+          // expected-note@+1 {{reference 'self.' explicitly}}
+          operation()
+        }
+      }
+    }
+  }
 }

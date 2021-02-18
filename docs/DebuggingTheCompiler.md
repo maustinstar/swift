@@ -212,47 +212,31 @@ Often it is not sufficient to dump the SIL at the beginning or end of
 the optimization pipeline. The SILPassManager supports useful options
 to dump the SIL also between pass runs.
 
-The SILPassManager's SIL dumping options vary along two orthogonal
-functional axes:
+A short (non-exhaustive) list of SIL printing options:
 
-1. Options that control if functions/modules are printed.
-2. Options that filter what is printed at those points.
+* `-Xllvm '-sil-print-function=SWIFT_MANGLED_NAME'`: Print the specified
+  function after each pass which modifies the function. Note that for module
+  passes, the function is printed if the pass changed _any_ function (the
+  pass manager doesn't know which functions a module pass has changed).
+  Multiple functions can be specified as a comma separated list.
 
-One generally always specifies an option of type 1 and optionally adds
-an option of type 2 to filter the output.
+* `-Xllvm '-sil-print-functions=NAME'`: Like `-sil-print-function`, except that
+  functions are selected if NAME is _contained_ in their mangled names.
 
-A short (non-exhaustive) list of type 1 options:
+* `-Xllvm -sil-print-all`: Print all functions when ever a function pass
+  modifies a function and print the entire module if a module pass modifies
+  the SILModule.
 
-* `-Xllvm -sil-print-all`: Print functions/modules when ever a
-  function pass modifies a function and Print the entire module
-  (modulo filtering) if a module pass modifies a SILModule.
+* `-Xllvm -sil-print-around=$PASS_NAME`: Print the SIL before and after a pass
+  with name `$PASS_NAME` runs on a function or module.
+  By default it prints the whole module. To print only specific functions, add
+  `-sil-print-function` and/or `-sil-print-functions`.
 
-A short (non-exhaustive) list of type 2 options:
+* `-Xllvm -sil-print-before=$PASS_NAME`: Like `-sil-print-around`, but prints
+  the SIL only _before_ the specfied pass runs.
 
-* `-Xllvm -sil-print-around=$PASS_NAME`: Print a function/module
-  before and after a function pass with name `$PASS_NAME` runs on a
-  function/module or dump a module before a module pass with name
-  `$PASS_NAME` runs on a module.
-
-* `-Xllvm -sil-print-before=$PASS_NAME`: Print a function/module
-  before a function pass with name `$PASS_NAME` runs on a
-  function/module or dump a module before a module pass with name
-  `$PASS_NAME` runs on a module. NOTE: This happens even without
-  sil-print-all set!
-
-* `-Xllvm -sil-print-after=$PASS_NAME`: Print a function/module
-  after a function pass with name `$PASS_NAME` runs on a
-  function/module or dump a module before a module pass with name
-  `$PASS_NAME` runs on a module.
-
-* `-Xllvm '-sil-print-only-function=SWIFT_MANGLED_NAME'`: When ever
-  one would print a function/module, only print the given function.
-
-These options together allow one to visualize how a
-SILFunction/SILModule is optimized by the optimizer as each
-optimization pass runs easily via formulations like:
-
-    swiftc -Xllvm '-sil-print-only-function=$myMainFunction' -Xllvm -sil-print-all
+* `-Xllvm -sil-print-after=$PASS_NAME`: Like `-sil-print-around`, but prints
+  the SIL only _after_ the specfied pass did run.
 
 NOTE: This may emit a lot of text to stderr, so be sure to pipe the
 output to a file.
@@ -586,11 +570,11 @@ it's quite easy to do this manually:
 
 2. Get the SIL before and after the bad optimization.
 
-  a. Add the compiler options
-     `-Xllvm -sil-print-all -Xllvm -sil-print-only-function='<function>'`
+  a. Add the compiler option
+     `-Xllvm -sil-print-function='<function>'`
      where `<function>` is the function name (including the preceding `$`).
      For example:
-     `-Xllvm -sil-print-all -Xllvm -sil-print-only-function='$s4test6testityS2iF'`.
+     `-Xllvm -sil-print-function='$s4test6testityS2iF'`.
      Again, the output can be large, so it's best to redirect stderr to a file.
   b. From the output, copy the SIL of the function *before* the bad
      run into a separate file and the SIL *after* the bad run into a file.
@@ -607,11 +591,11 @@ missing important content from the downstream branch. As an example,
 consider a situation where one has the following straw man commit flow
 graph:
 
-    github/master -> github/tensorflow
+    github/main -> github/tensorflow
 
 In this case if one attempts to use `git-bisect` on
 github/tensorflow, `git-bisect` will sometimes choose commits from
-github/master resulting in one being unable to compile/test specific
+github/main resulting in one being unable to compile/test specific
 tensorflow code that has not been upstreamed yet. Even worse, what if
 we are trying to bisect in between two that were branched from
 github/tensorflow and have had subsequent commits cherry-picked on
@@ -619,7 +603,7 @@ top. Without any loss of generality, lets call those two tags
 `tag-tensorflow-bad` and `tag-tensorflow-good`. Since both of
 these tags have had commits cherry-picked on top, they are technically
 not even on the github/tensorflow branch, but rather in a certain
-sense are a tag of a feature branch from master/tensorflow. So,
+sense are a tag of a feature branch from main/tensorflow. So,
 `git-bisect` doesn't even have a clear history to bisect on in
 multiple ways.
 
@@ -634,14 +618,14 @@ commits. We can compute this as so:
 
 Given that both tags were taken from the feature branch, the reader
 can prove to themselves that this commit is guaranteed to be on
-`github/tensorflow` and not `github/master` since all commits from
-`github/master` are forwarded using git merges.
+`github/tensorflow` and not `github/main` since all commits from
+`github/main` are forwarded using git merges.
 
 Then lets assume that we checked out `$TAG_MERGE_BASE` and then ran
 `test.sh` and did not hit any error. Ok, we can not bisect. Sadly,
 as mentioned above if we run git-bisect in between `$TAG_MERGE_BASE`
 and `tags/tag-tensorflow-bad`, `git-bisect` will sometimes choose
-commits from `github/master` which would cause `test.sh` to fail
+commits from `github/main` which would cause `test.sh` to fail
 if we are testing tensorflow specific code! To work around this
 problem, we need to start our bisect and then tell `git-bisect` to
 ignore those commits by using the skip sub command:
@@ -875,14 +859,14 @@ well as cleanups/modernizations on a code-base. Swift's cmake invocation by
 default creates one of these json databases at the root path of the swift host
 build, for example on macOS:
 
-    $PATH_TO_BUILD/swift-macosx-x86_64/compile_commands.json
+    $PATH_TO_BUILD/swift-macosx-$(uname -m)/compile_commands.json
 
 Using this file, one invokes `clang-tidy` on a specific file in the codebase
 as follows:
 
-    clang-tidy -p=$PATH_TO_BUILD/swift-macosx-x86_64/compile_commands.json $FULL_PATH_TO_FILE
+    clang-tidy -p=$PATH_TO_BUILD/swift-macosx-$(uname -m)/compile_commands.json $FULL_PATH_TO_FILE
 
 One can also use shell regex to visit multiple files in the same directory. Example:
 
-    clang-tidy -p=$PATH_TO_BUILD/swift-macosx-x86_64/compile_commands.json $FULL_PATH_TO_DIR/*.cpp
+    clang-tidy -p=$PATH_TO_BUILD/swift-macosx-$(uname -m)/compile_commands.json $FULL_PATH_TO_DIR/*.cpp
 

@@ -28,6 +28,7 @@
 #include <string>
 
 using namespace swift::constraints;
+using namespace swift::constraints::inference;
 
 namespace swift {
 namespace unittest {
@@ -67,11 +68,16 @@ public:
 protected:
   Type getStdlibType(StringRef name) const;
 
+  NominalTypeDecl *getStdlibNominalTypeDecl(StringRef name) const;
+
+  VarDecl *addExtensionVarMember(NominalTypeDecl *decl, StringRef name,
+                                 Type type) const;
+
   ProtocolType *createProtocol(llvm::StringRef protocolName,
                                Type parent = Type());
 
-  static ConstraintSystem::PotentialBindings
-  inferBindings(ConstraintSystem &cs, TypeVariableType *typeVar);
+  static PotentialBindings inferBindings(ConstraintSystem &cs,
+                                         TypeVariableType *typeVar);
 };
 
 } // end namespace unittest

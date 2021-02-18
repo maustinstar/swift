@@ -71,7 +71,7 @@ static bool isClangKeyword(Identifier name) {
 
   if (name.empty())
     return false;
-  return keywords.find(name.str()) != keywords.end();
+  return keywords.contains(name.str());
 }
 
 
@@ -880,6 +880,9 @@ private:
         break;
       case PlatformKind::OpenBSD:
         plat = "openbsd";
+        break;
+      case PlatformKind::Windows:
+        plat = "windows";
         break;
       case PlatformKind::none:
         llvm_unreachable("handled above");
@@ -1706,7 +1709,7 @@ private:
       auto *clangDecl = SD->getClangDecl();
       if (!clangDecl)
         return false;
-      return clangDecl->hasAttr<clang::SwiftNewtypeAttr>();
+      return clangDecl->hasAttr<clang::SwiftNewTypeAttr>();
     };
 
     // Use the type as bridged to Objective-C unless the element type is itself

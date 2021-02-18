@@ -29,7 +29,8 @@ struct I : P {
   init(int: Int64)
 }
 
-// CHECK-LL-LABEL: define hidden swiftcc void @I_printMe(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* {{%[0-9]+}}) {{#[0-9]*}} {
+// CHECK-LL: @I_printMeTu =
+// CHECK-LL-LABEL: define hidden swiftcc void @I_printMe(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* swiftasync {{%[0-9]+}}) {{#[0-9]*}} {
 sil hidden @I_printMe : $@async @convention(method) (I) -> Int64 {
 bb0(%self : $I):
   %self_addr = alloc_stack $I
@@ -41,7 +42,7 @@ bb0(%self : $I):
   return %result : $Int64
 }
 
-// CHECK-LL-LABEL: define internal swiftcc void @I_P_printMe(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* {{%[0-9]+}}) {{#[0-9]*}} {
+// CHECK-LL-LABEL: define internal swiftcc void @I_P_printMe(%swift.task* {{%[0-9]+}}, %swift.executor* {{%[0-9]+}}, %swift.context* swiftasync {{%[0-9]+}}) {{#[0-9]*}} {
 sil private [transparent] [thunk] @I_P_printMe : $@async @convention(witness_method: P) (@in_guaranteed I) -> Int64 {
 bb0(%self_addr : $*I):
   %self = load %self_addr : $*I
@@ -50,8 +51,7 @@ bb0(%self_addr : $*I):
   return %result : $Int64
 }
 
-sil @main : $@async @convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
-bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
+sil @test_case : $@convention(thin) @async () -> () {
   %i_type = metatype $@thin I.Type
   %i_int_literal = integer_literal $Builtin.Int64, 99
   %i_int = struct $Int64 (%i_int_literal : $Builtin.Int64)
@@ -64,6 +64,22 @@ bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>
   %printInt64 = function_ref @printInt64 : $@convention(thin) (Int64) -> ()
   %printInt64_result = apply %printInt64(%result) : $@convention(thin) (Int64) -> () // CHECK: 99
 
+
+  %void = tuple()
+  return %void : $()
+}
+
+// Defined in _Concurrency
+sil @$s12_Concurrency13_runAsyncMainyyyyYKcF : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
+
+// main
+sil @main : $@convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
+bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
+  %test_case_nothrow = function_ref @test_case : $@convention(thin) @async () -> ()
+  %test_case = convert_function %test_case_nothrow : $@convention(thin) @async () -> () to $@convention(thin) @async () -> @error Error
+  %thick_test_case = thin_to_thick_function %test_case : $@convention(thin) @async () -> @error Error to $@callee_guaranteed @async () -> @error Error
+  %runAsyncMain = function_ref @$s12_Concurrency13_runAsyncMainyyyyYKcF : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
+  %result = apply %runAsyncMain(%thick_test_case) : $@convention(thin) (@guaranteed @async @callee_guaranteed () -> @error Error) -> ()
   %out_literal = integer_literal $Builtin.Int32, 0
   %out = struct $Int32 (%out_literal : $Builtin.Int32)
   return %out : $Int32
@@ -72,4 +88,3 @@ bb0(%0 : $Int32, %1 : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>
 sil_witness_table hidden I: P module main {
   method #P.printMe: <Self where Self : P> (Self) -> () async -> Int64 : @I_P_printMe
 }
-

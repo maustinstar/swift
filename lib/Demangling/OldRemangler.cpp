@@ -369,6 +369,9 @@ void Remangler::mangleGenericSpecializationPrespecialized(Node *node) {
 void Remangler::mangleGenericSpecializationNotReAbstracted(Node *node) {
   unreachable("unsupported");
 }
+void Remangler::mangleGenericSpecializationInResilienceDomain(Node *node) {
+  unreachable("unsupported");
+}
 
 void Remangler::mangleInlinedGenericFunction(Node *node) {
   unreachable("unsupported");
@@ -630,6 +633,10 @@ void Remangler::mangleValueWitnessTable(Node *node) {
   mangleSingleChildNode(node); // type
 }
 
+void Remangler::mangleConcurrentFunctionType(Node *node) {
+  Buffer << "y";
+}
+
 void Remangler::mangleAsyncAnnotation(Node *node) {
   Buffer << "Z";
 }
@@ -737,6 +744,34 @@ void Remangler::mangleReabstractionThunk(Node *node) {
   Buffer << "<reabstraction-thunk>";
 }
 
+void Remangler::mangleAutoDiffFunction(Node *node, EntityContext &ctx) {
+  Buffer << "<autodiff-function>";
+}
+
+void Remangler::mangleAutoDiffDerivativeVTableThunk(Node *node) {
+  Buffer << "<autodiff-derivative-vtable-thunk>";
+}
+
+void Remangler::mangleAutoDiffSelfReorderingReabstractionThunk(Node *node) {
+  Buffer << "<autodiff-self-reordering-reabstraction-thunk>";
+}
+
+void Remangler::mangleAutoDiffSubsetParametersThunk(Node *node) {
+  Buffer << "<autodiff-subset-parameters-thunk>";
+}
+
+void Remangler::mangleAutoDiffFunctionKind(Node *node) {
+  Buffer << "<autodiff-function-kind>";
+}
+
+void Remangler::mangleDifferentiabilityWitness(Node *node) {
+  Buffer << "<differentiability-witness>";
+}
+
+void Remangler::mangleIndexSubset(Node *node) {
+  Buffer << "<index-subset>";
+}
+
 void Remangler::mangleProtocolSelfConformanceWitness(Node *node) {
   Buffer << "TS";
   mangleSingleChildNode(node); // entity
@@ -811,6 +846,10 @@ void Remangler::manglePropertyWrapperBackingInitializer(Node *node,
 void Remangler::mangleDefaultArgumentInitializer(Node *node,
                                                  EntityContext &ctx) {
   mangleNamedEntity(node, 'I', "A", ctx);
+}
+
+void Remangler::mangleAsyncFunctionPointer(Node *node) {
+  Buffer << "Tu";
 }
 
 void Remangler::mangleDeallocator(Node *node, EntityContext &ctx) {
@@ -1248,6 +1287,8 @@ void Remangler::mangleImplFunctionAttribute(Node *node) {
     Buffer << "A";
   } else if (text == "@yield_many") {
     Buffer << "G";
+  } else if (text == "@concurrent") {
+    Buffer << "h";
   } else if (text == "@async") {
     Buffer << "H";
   } else {
@@ -1300,14 +1341,9 @@ void Remangler::mangleImplYield(Node *node) {
   mangleChildNodes(node); // impl convention, type
 }
 
-void Remangler::mangleImplDifferentiable(Node *node) {
+void Remangler::mangleImplDifferentiabilityKind(Node *node) {
   // TODO(TF-750): Check if this code path actually triggers and add a test.
-  Buffer << 'd';
-}
-
-void Remangler::mangleImplLinear(Node *node) {
-  // TODO(TF-750): Check if this code path actually triggers and add a test.
-  Buffer << 'l';
+  Buffer << (char)node->getIndex();
 }
 
 void Remangler::mangleImplEscaping(Node *node) {
@@ -1348,8 +1384,8 @@ void Remangler::mangleImplConvention(Node *node) {
   }
 }
 
-void Remangler::mangleImplDifferentiability(Node *node) {
-  assert(node->getKind() == Node::Kind::ImplDifferentiability);
+void Remangler::mangleImplParameterResultDifferentiability(Node *node) {
+  assert(node->getKind() == Node::Kind::ImplDifferentiabilityKind);
   StringRef text = node->getText();
   // Empty string represents default differentiability.
   if (text.empty())
@@ -2166,13 +2202,16 @@ void Remangler::mangleGlobalVariableOnceFunction(Node *node) {
 void Remangler::mangleGlobalVariableOnceDeclList(Node *node) {
   unreachable("unsupported");
 }
+void Remangler::manglePredefinedObjCAsyncCompletionHandlerImpl(Node *node) {
+  unreachable("unsupported");
+}
 void Remangler::mangleObjCAsyncCompletionHandlerImpl(Node *node) {
   unreachable("unsupported");
 }
 
 void Remangler::mangleCanonicalSpecializedGenericMetaclass(Node *node) {
-  Buffer << "MM";
   mangleSingleChildNode(node); // type
+  Buffer << "MM";
 }
 
 void Remangler::mangleCanonicalSpecializedGenericTypeMetadataAccessFunction(

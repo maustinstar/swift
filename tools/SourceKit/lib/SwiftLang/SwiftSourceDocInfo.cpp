@@ -36,6 +36,7 @@
 #include "swift/IDE/IDERequests.h"
 #include "swift/Markup/XMLUtils.h"
 #include "swift/Sema/IDETypeChecking.h"
+#include "swift/SymbolGraphGen/SymbolGraphGen.h"
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/DeclObjC.h"
@@ -484,7 +485,7 @@ void SwiftLangSupport::printFullyAnnotatedSynthesizedDeclaration(
 }
 
 template <typename FnTy>
-void walkRelatedDecls(const ValueDecl *VD, const FnTy &Fn) {
+static void walkRelatedDecls(const ValueDecl *VD, const FnTy &Fn) {
   if (isa<ParamDecl>(VD))
     return; // Parameters don't have interesting related declarations.
 
@@ -739,12 +740,13 @@ static bool passCursorInfoForDecl(SourceFile* SF,
                                   const Type ContainerTy,
                                   bool IsRef,
                                   bool RetrieveRefactoring,
+                                  bool SymbolGraph,
                                   ResolvedCursorInfo TheTok,
                                   Optional<unsigned> OrigBufferID,
                                   SourceLoc CursorLoc,
                   ArrayRef<RefactoringInfo> KownRefactoringInfoFromRange,
                                   SwiftLangSupport &Lang,
-                                  const CompilerInvocation &Invok,
+                                  const CompilerInvocation &Invoc,
                                   std::string &Diagnostic,
                       ArrayRef<ImmutableTextSnapshotRef> PreviousASTSnaps,
                   std::function<void(const RequestResult<CursorInfoData> &)> Receiver) {
@@ -758,8 +760,9 @@ static bool passCursorInfoForDecl(SourceFile* SF,
   bool InSynthesizedExtension = false;
   if (BaseType) {
     if (auto Target = BaseType->getAnyNominal()) {
-      SynthesizedExtensionAnalyzer Analyzer(Target,
-                                          PrintOptions::printModuleInterface());
+      SynthesizedExtensionAnalyzer Analyzer(
+          Target, PrintOptions::printModuleInterface(
+                      Invoc.getFrontendOptions().PrintFullConvention));
       InSynthesizedExtension = Analyzer.isInSynthesizedExtension(VD);
     }
   }
@@ -816,6 +819,7 @@ static bool passCursorInfoForDecl(SourceFile* SF,
   // If VD is the syntehsized property wrapper backing storage (_foo) or
   // projected value ($foo) of a property (foo), use that property's
   // documentation instead.
+
   unsigned DocCommentBegin = SS.size();
   {
     llvm::raw_svector_ostream OS(SS);
@@ -829,6 +833,32 @@ static bool passCursorInfoForDecl(SourceFile* SF,
     printAnnotatedDeclaration(VD, BaseType, OS);
   }
   unsigned DeclEnd = SS.size();
+
+
+  SmallVector<symbolgraphgen::PathComponent, 4> PathComponents;
+  unsigned SymbolGraphBegin = SS.size();
+  if (SymbolGraph) {
+    symbolgraphgen::SymbolGraphOptions Options {
+      "",
+      Invoc.getLangOptions().Target,
+      /*PrettyPrint=*/false,
+      AccessLevel::Private,
+      /*EmitSynthesizedMembers*/false,
+    };
+    llvm::raw_svector_ostream OS(SS);
+    symbolgraphgen::printSymbolGraphForDecl(VD, BaseType,
+                                            InSynthesizedExtension, Options, OS,
+                                            PathComponents);
+  }
+  unsigned SymbolGraphEnd = SS.size();
+
+  DelayedStringRetriever ParentUSRsOS(SS);
+  for (auto &Component: PathComponents) {
+    ParentUSRsOS.startPiece();
+    if (SwiftLangSupport::printUSR(Component.VD, OS))
+      ParentUSRsOS.startPiece(); // ignore any output if invalid
+    ParentUSRsOS.endPiece();
+  };
 
   unsigned FullDeclBegin = SS.size();
   {
@@ -938,7 +968,7 @@ static bool passCursorInfoForDecl(SourceFile* SF,
     ModuleName = MD->getNameStr().str();
   }
   StringRef ModuleInterfaceName;
-  if (auto IFaceGenRef = Lang.getIFaceGenContexts().find(ModuleName, Invok))
+  if (auto IFaceGenRef = Lang.getIFaceGenContexts().find(ModuleName, Invoc))
     ModuleInterfaceName = IFaceGenRef->getDocumentName();
 
   UIdent Kind = SwiftLangSupport::getUIDForDecl(VD, IsRef);
@@ -960,6 +990,17 @@ static bool passCursorInfoForDecl(SourceFile* SF,
   StringRef GroupName = StringRef(SS.begin() + GroupBegin, GroupEnd - GroupBegin);
   StringRef LocalizationKey = StringRef(SS.begin() + LocalizationBegin,
                                         LocalizationEnd - LocalizationBegin);
+  StringRef SymbolGraphJSON = StringRef(SS.begin()+SymbolGraphBegin,
+                                        SymbolGraphEnd-SymbolGraphBegin);
+
+  SmallVector<ParentInfo, 4> Parents;
+  auto ParentIt = PathComponents.begin();
+  ParentUSRsOS.retrieve([&](StringRef ParentUSR) {
+    assert(ParentIt != PathComponents.end());
+    if (!ParentUSR.empty())
+      Parents.push_back({ParentIt->Title, ParentIt->Kind, ParentUSR});
+    ++ParentIt;
+  });
 
   // If VD is the syntehsized property wrapper backing storage (_foo) or
   // projected value ($foo) of a property (foo), base the location on that
@@ -1020,6 +1061,8 @@ static bool passCursorInfoForDecl(SourceFile* SF,
   Info.TypeInterface = StringRef();
   Info.AvailableActions = llvm::makeArrayRef(RefactoringInfoBuffer);
   Info.ParentNameOffset = getParamParentNameOffset(VD, CursorLoc);
+  Info.SymbolGraph = SymbolGraphJSON;
+  Info.ParentContexts = llvm::makeArrayRef(Parents);
   Receiver(RequestResult<CursorInfoData>::fromResult(Info));
   return true;
 }
@@ -1165,10 +1208,9 @@ static bool passNameInfoForDecl(ResolvedCursorInfo CursorInfo,
     NameTranslatingInfo Result;
     Result.NameKind = SwiftLangSupport::getUIDForNameKind(NameKind::Swift);
     Result.BaseName = Name.getBaseName().userFacingName();
-    std::transform(Name.getArgumentNames().begin(),
-                   Name.getArgumentNames().end(),
-                   std::back_inserter(Result.ArgNames),
-                   [](Identifier Id) { return Id.str(); });
+    llvm::transform(Name.getArgumentNames(),
+                    std::back_inserter(Result.ArgNames),
+                    [](Identifier Id) { return Id.str(); });
     Receiver(RequestResult<NameTranslatingInfo>::fromResult(Result));
     return true;
   }
@@ -1258,8 +1300,9 @@ public:
 
 static void resolveCursor(
     SwiftLangSupport &Lang, StringRef InputFile, unsigned Offset,
-    unsigned Length, bool Actionables, SwiftInvocationRef Invok,
-    bool TryExistingAST, bool CancelOnSubsequentRequest,
+    unsigned Length, bool Actionables, bool SymbolGraph,
+    SwiftInvocationRef Invok, bool TryExistingAST,
+    bool CancelOnSubsequentRequest,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> fileSystem,
     std::function<void(const RequestResult<CursorInfoData> &)> Receiver) {
   assert(Invok);
@@ -1267,11 +1310,12 @@ static void resolveCursor(
 
   class CursorInfoConsumer : public CursorRangeInfoConsumer {
     bool Actionables;
+    bool SymbolGraph;
     std::function<void(const RequestResult<CursorInfoData> &)> Receiver;
 
   public:
     CursorInfoConsumer(StringRef InputFile, unsigned Offset,
-                       unsigned Length, bool Actionables,
+                       unsigned Length, bool Actionables, bool SymbolGraph,
                        SwiftLangSupport &Lang,
                        SwiftInvocationRef ASTInvok,
                        bool TryExistingAST,
@@ -1280,6 +1324,7 @@ static void resolveCursor(
     : CursorRangeInfoConsumer(InputFile, Offset, Length, Lang, ASTInvok,
                               TryExistingAST, CancelOnSubsequentRequest),
       Actionables(Actionables),
+      SymbolGraph(SymbolGraph),
       Receiver(std::move(Receiver)){ }
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
@@ -1377,6 +1422,7 @@ static void resolveCursor(
                                              ContainerType,
                                              CursorInfo.IsRef,
                                              Actionables,
+                                             SymbolGraph,
                                              CursorInfo,
                                              BufferID, Loc,
                                              AvailableRefactorings,
@@ -1387,9 +1433,9 @@ static void resolveCursor(
           if (!getPreviousASTSnaps().empty()) {
             // Attempt again using the up-to-date AST.
             resolveCursor(Lang, InputFile, Offset, Length, Actionables,
-                          ASTInvok,
-                          /*TryExistingAST=*/false, CancelOnSubsequentRequest,
-                          SM.getFileSystem(), Receiver);
+                          SymbolGraph, ASTInvok, /*TryExistingAST=*/false,
+                          CancelOnSubsequentRequest, SM.getFileSystem(),
+                          Receiver);
           } else {
             CursorInfoData Info;
             Info.InternalDiagnostic = Diagnostic;
@@ -1446,8 +1492,8 @@ static void resolveCursor(
   };
 
   auto Consumer = std::make_shared<CursorInfoConsumer>(
-    InputFile, Offset, Length, Actionables, Lang, Invok, TryExistingAST,
-    CancelOnSubsequentRequest, Receiver);
+    InputFile, Offset, Length, Actionables, SymbolGraph, Lang, Invok,
+    TryExistingAST, CancelOnSubsequentRequest, Receiver);
 
   /// FIXME: When request cancellation is implemented and Xcode adopts it,
   /// don't use 'OncePerASTToken'.
@@ -1650,8 +1696,8 @@ static void resolveRange(SwiftLangSupport &Lang,
 
 void SwiftLangSupport::getCursorInfo(
     StringRef InputFile, unsigned Offset, unsigned Length, bool Actionables,
-    bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
-    Optional<VFSOptions> vfsOptions,
+    bool SymbolGraph, bool CancelOnSubsequentRequest,
+    ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
     std::function<void(const RequestResult<CursorInfoData> &)> Receiver) {
 
   std::string error;
@@ -1660,7 +1706,8 @@ void SwiftLangSupport::getCursorInfo(
     return Receiver(RequestResult<CursorInfoData>::fromError(error));
 
   if (auto IFaceGenRef = IFaceGenContexts.get(InputFile)) {
-    IFaceGenRef->accessASTAsync([this, IFaceGenRef, Offset, Actionables, Receiver] {
+    IFaceGenRef->accessASTAsync([this, IFaceGenRef, Offset, Actionables,
+                                 SymbolGraph, Receiver] {
       SwiftInterfaceGenContext::ResolvedEntity Entity;
       Entity = IFaceGenRef->resolveEntityForOffset(Offset);
       if (Entity.isResolved()) {
@@ -1673,10 +1720,10 @@ void SwiftLangSupport::getCursorInfo(
           std::string Diagnostic;  // Unused.
           ModuleDecl *MainModule = IFaceGenRef->getModuleDecl();
           passCursorInfoForDecl(
-              /*SourceFile*/nullptr, Entity.Dcl, MainModule,
-              Type(), Entity.IsRef, Actionables, ResolvedCursorInfo(),
-              /*OrigBufferID=*/None, SourceLoc(),
-              {}, *this, Invok, Diagnostic, {}, Receiver);
+              /*SourceFile*/nullptr, Entity.Dcl, MainModule, Type(),
+              Entity.IsRef, Actionables, SymbolGraph, ResolvedCursorInfo(),
+              /*OrigBufferID=*/None, SourceLoc(), {}, *this, Invok, Diagnostic,
+              {}, Receiver);
         }
       } else {
         CursorInfoData Info;
@@ -1697,9 +1744,9 @@ void SwiftLangSupport::getCursorInfo(
     return;
   }
 
-  resolveCursor(*this, InputFile, Offset, Length, Actionables, Invok,
-                /*TryExistingAST=*/true, CancelOnSubsequentRequest, fileSystem,
-                Receiver);
+  resolveCursor(*this, InputFile, Offset, Length, Actionables, SymbolGraph,
+                Invok, /*TryExistingAST=*/true, CancelOnSubsequentRequest,
+                fileSystem, Receiver);
 }
 
 void SwiftLangSupport::
@@ -1853,7 +1900,8 @@ static void resolveCursorFromUSR(
         std::string Diagnostic;
         bool Success =
             passCursorInfoForDecl(/*SourceFile*/nullptr, D, MainModule, selfTy,
-                                  /*IsRef=*/false, false, ResolvedCursorInfo(),
+                                  /*IsRef=*/false, /*Actionables*/false,
+                                  /*SymbolGraph*/false, ResolvedCursorInfo(),
                                   BufferID, SourceLoc(), {}, Lang, CompInvok,
                                   Diagnostic, PreviousASTSnaps, Receiver);
         if (!Success) {

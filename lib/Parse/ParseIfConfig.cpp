@@ -102,7 +102,7 @@ class ValidateIfConfigCondition :
     return nullptr;
   }
 
-  // Support '||' and '&&' operator. The procedence of '&&' is higher than '||'.
+  // Support '||' and '&&' operator. The precedence of '&&' is higher than '||'.
   // Invalid operator and the next operand are diagnosed and removed from AST.
   Expr *foldSequence(Expr *LHS, ArrayRef<Expr*> &S, bool isRecurse = false) {
     assert(!S.empty() && ((S.size() & 1) == 0));
@@ -407,7 +407,19 @@ public:
 
   bool visitUnresolvedDeclRefExpr(UnresolvedDeclRefExpr *E) {
     auto Name = getDeclRefStr(E);
-    return Ctx.LangOpts.isCustomConditionalCompilationFlagSet(Name);
+
+    // Check whether this is any one of the known compiler features.
+    const auto &langOpts = Ctx.LangOpts;
+    bool isKnownFeature = llvm::StringSwitch<bool>(Name)
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option) \
+        .Case("$" #FeatureName, Option)
+#include "swift/Basic/Features.def"
+        .Default(false);
+
+    if (isKnownFeature)
+      return true;
+    
+    return langOpts.isCustomConditionalCompilationFlagSet(Name);
   }
 
   bool visitCallExpr(CallExpr *E) {
@@ -616,7 +628,7 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
       SourceMgr.getCodeCompletionBufferID() == L->getBufferID() &&
       SourceMgr.isBeforeInBuffer(Tok.getLoc(),
                                  SourceMgr.getCodeCompletionLoc())) {
-    llvm::SaveAndRestore<Optional<llvm::MD5>> H(CurrentTokenHash, None);
+    llvm::SaveAndRestore<Optional<StableHasher>> H(CurrentTokenHash, None);
     BacktrackingScope backtrack(*this);
     do {
       auto startLoc = Tok.getLoc();
@@ -635,7 +647,7 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
       // Don't evaluate if it's in '-parse' mode, etc.
       shouldEvaluatePoundIfDecls() &&
       // If it's in inactive #if ... #endif block, there's no point to do it.
-      !getScopeInfo().isInactiveConfigBlock() &&
+      !InInactiveClauseEnvironment &&
       // If this directive contains code completion location, 'isActive' is
       // determined solely by which block has the completion token.
       !codeCompletionClauseLoc.isValid();
@@ -706,7 +718,7 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
     llvm::SaveAndRestore<bool> S(InInactiveClauseEnvironment,
                                  InInactiveClauseEnvironment || !isActive);
     // Disable updating the interface hash inside inactive blocks.
-    Optional<llvm::SaveAndRestore<Optional<llvm::MD5>>> T;
+    Optional<llvm::SaveAndRestore<Optional<StableHasher>>> T;
     if (!isActive)
       T.emplace(CurrentTokenHash, None);
 

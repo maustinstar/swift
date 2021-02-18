@@ -154,11 +154,11 @@ AllocStackInst::AllocStackInst(SILDebugLocation Loc, SILType elementType,
                                bool hasDynamicLifetime)
     : InstructionBase(Loc, elementType.getAddressType()),
     dynamicLifetime(hasDynamicLifetime) {
-  SILInstruction::Bits.AllocStackInst.NumOperands =
+  SILNode::Bits.AllocStackInst.NumOperands =
     TypeDependentOperands.size();
-  assert(SILInstruction::Bits.AllocStackInst.NumOperands ==
+  assert(SILNode::Bits.AllocStackInst.NumOperands ==
          TypeDependentOperands.size() && "Truncation");
-  SILInstruction::Bits.AllocStackInst.VarInfo =
+  SILNode::Bits.AllocStackInst.VarInfo =
     TailAllocatedDebugVariable(Var, getTrailingObjects<char>()).getRawValue();
   TrailingOperandsList::InitOperandsList(getAllOperands().begin(), this,
                                          TypeDependentOperands);
@@ -205,10 +205,10 @@ AllocRefInstBase::AllocRefInstBase(SILInstructionKind Kind,
                                    bool objc, bool canBeOnStack,
                                    ArrayRef<SILType> ElementTypes)
     : AllocationInst(Kind, Loc, ObjectType) {
-  SILInstruction::Bits.AllocRefInstBase.ObjC = objc;
-  SILInstruction::Bits.AllocRefInstBase.OnStack = canBeOnStack;
-  SILInstruction::Bits.AllocRefInstBase.NumTailTypes = ElementTypes.size();
-  assert(SILInstruction::Bits.AllocRefInstBase.NumTailTypes ==
+  SILNode::Bits.AllocRefInstBase.ObjC = objc;
+  SILNode::Bits.AllocRefInstBase.OnStack = canBeOnStack;
+  SILNode::Bits.AllocRefInstBase.NumTailTypes = ElementTypes.size();
+  assert(SILNode::Bits.AllocRefInstBase.NumTailTypes ==
          ElementTypes.size() && "Truncation");
   assert(!objc || ElementTypes.empty());
 }
@@ -482,7 +482,11 @@ BeginApplyInst::create(SILDebugLocation loc, SILValue callee,
   }
 
   resultTypes.push_back(SILType::getSILTokenType(F.getASTContext()));
-  resultOwnerships.push_back(ValueOwnershipKind::None);
+  // The begin_apply token represents the borrow scope of all owned and
+  // guaranteed call arguments. Although SILToken is (currently) trivially
+  // typed, it must have guaranteed ownership so end_apply and abort_apply will
+  // be recognized as lifetime-ending uses.
+  resultOwnerships.push_back(OwnershipKind::Guaranteed);
 
   SmallVector<SILValue, 32> typeDependentOperands;
   collectTypeDependentOperands(typeDependentOperands, openedArchetypes, F,
@@ -612,7 +616,7 @@ SILType DifferentiableFunctionInst::getDifferentiableFunctionType(
     IndexSubset *ResultIndices) {
   assert(!ResultIndices->isEmpty());
   auto fnTy = OriginalFunction->getType().castTo<SILFunctionType>();
-  auto diffTy = fnTy->getWithDifferentiability(DifferentiabilityKind::Normal,
+  auto diffTy = fnTy->getWithDifferentiability(DifferentiabilityKind::Reverse,
                                                ParameterIndices, ResultIndices);
   return SILType::getPrimitiveObjectType(diffTy);
 }
@@ -621,7 +625,7 @@ ValueOwnershipKind DifferentiableFunctionInst::getMergedOwnershipKind(
     SILValue OriginalFunction, ArrayRef<SILValue> DerivativeFunctions) {
   if (DerivativeFunctions.empty())
     return OriginalFunction.getOwnershipKind();
-  return *mergeSILValueOwnership(
+  return mergeSILValueOwnership(
       {OriginalFunction, DerivativeFunctions[0], DerivativeFunctions[1]});
 }
 
@@ -635,7 +639,7 @@ DifferentiableFunctionInst::DifferentiableFunctionInst(
                                         ResultIndices),
           HasOwnership
               ? getMergedOwnershipKind(OriginalFunction, DerivativeFunctions)
-              : ValueOwnershipKind(ValueOwnershipKind::None)),
+              : ValueOwnershipKind(OwnershipKind::None)),
       ParameterIndices(ParameterIndices), ResultIndices(ResultIndices),
       HasDerivativeFunctions(!DerivativeFunctions.empty()) {
   assert(DerivativeFunctions.empty() || DerivativeFunctions.size() == 2);
@@ -669,25 +673,24 @@ SILType LinearFunctionInst::getLinearFunctionType(
   return SILType::getPrimitiveObjectType(diffTy);
 }
 
-LinearFunctionInst::LinearFunctionInst(
-    SILDebugLocation Loc, IndexSubset *ParameterIndices,
-    SILValue OriginalFunction, Optional<SILValue> TransposeFunction,
-    bool HasOwnership)
+LinearFunctionInst::LinearFunctionInst(SILDebugLocation Loc,
+                                       IndexSubset *ParameterIndices,
+                                       SILValue OriginalFunction,
+                                       Optional<SILValue> TransposeFunction,
+                                       bool HasOwnership)
     : InstructionBaseWithTrailingOperands(
           OriginalFunction,
           TransposeFunction.hasValue()
               ? ArrayRef<SILValue>(TransposeFunction.getPointer(), 1)
               : ArrayRef<SILValue>(),
           Loc, getLinearFunctionType(OriginalFunction, ParameterIndices),
-          HasOwnership ? (
-            TransposeFunction
-                ? *mergeSILValueOwnership(
-                       {OriginalFunction, *TransposeFunction})
-                : *mergeSILValueOwnership({OriginalFunction})
-          ) : ValueOwnershipKind(ValueOwnershipKind::None)),
+          HasOwnership
+              ? (TransposeFunction ? mergeSILValueOwnership(
+                                         {OriginalFunction, *TransposeFunction})
+                                   : mergeSILValueOwnership({OriginalFunction}))
+              : ValueOwnershipKind(OwnershipKind::None)),
       ParameterIndices(ParameterIndices),
-      HasTransposeFunction(TransposeFunction.hasValue()) {
-}
+      HasTransposeFunction(TransposeFunction.hasValue()) {}
 
 LinearFunctionInst *LinearFunctionInst::create(
     SILModule &Module, SILDebugLocation Loc, IndexSubset *ParameterIndices,
@@ -704,7 +707,11 @@ SILType DifferentiableFunctionExtractInst::getExtracteeType(
     SILValue function, NormalDifferentiableFunctionTypeComponent extractee,
     SILModule &module) {
   auto fnTy = function->getType().castTo<SILFunctionType>();
-  assert(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal);
+  // TODO: Ban 'Normal' and 'Forward'.
+  assert(
+      fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Reverse ||
+      fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal ||
+      fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Forward);
   auto originalFnTy = fnTy->getWithoutDifferentiability();
   auto kindOpt = extractee.getAsDerivativeFunctionKind();
   if (!kindOpt) {
@@ -725,20 +732,9 @@ DifferentiableFunctionExtractInst::DifferentiableFunctionExtractInst(
     : UnaryInstructionBase(debugLoc, function,
                            extracteeType
                                ? *extracteeType
-                               : getExtracteeType(function, extractee, module)),
+                               : getExtracteeType(function, extractee, module),
+                           function.getOwnershipKind()),
       Extractee(extractee), HasExplicitExtracteeType(extracteeType.hasValue()) {
-#ifndef NDEBUG
-  if (extracteeType.hasValue()) {
-    // Note: explicit extractee type is used to avoid inconsistent typing in:
-    // - Canonical SIL, due to generic specialization.
-    // - Lowered SIL, due to LoadableByAddress.
-    // See `TypeSubstCloner::visitDifferentiableFunctionExtractInst` for an
-    // explanation of how explicit extractee type is used.
-    assert((module.getStage() == SILStage::Canonical ||
-            module.getStage() == SILStage::Lowered) &&
-           "Explicit type is valid only in canonical or lowered SIL");
-  }
-#endif
 }
 
 SILType LinearFunctionExtractInst::
@@ -764,7 +760,8 @@ LinearFunctionExtractInst::LinearFunctionExtractInst(
     SILModule &module, SILDebugLocation debugLoc,
     LinearDifferentiableFunctionTypeComponent extractee, SILValue function)
     : UnaryInstructionBase(debugLoc, function,
-                           getExtracteeType(function, extractee, module)),
+                           getExtracteeType(function, extractee, module),
+                           function.getOwnershipKind()),
       extractee(extractee) {}
 
 SILType DifferentiabilityWitnessFunctionInst::getDifferentiabilityWitnessType(
@@ -899,7 +896,7 @@ static void *allocateLiteralInstWithBitSize(SILModule &M, unsigned bits) {
 IntegerLiteralInst::IntegerLiteralInst(SILDebugLocation Loc, SILType Ty,
                                        const llvm::APInt &Value)
     : InstructionBase(Loc, Ty) {
-  SILInstruction::Bits.IntegerLiteralInst.numBits = Value.getBitWidth();
+  SILNode::Bits.IntegerLiteralInst.numBits = Value.getBitWidth();
   std::uninitialized_copy_n(Value.getRawData(), Value.getNumWords(),
                             getTrailingObjects<llvm::APInt::WordType>());
 }
@@ -959,7 +956,7 @@ IntegerLiteralInst *IntegerLiteralInst::create(IntegerLiteralExpr *E,
 
 /// getValue - Return the APInt for the underlying integer literal.
 APInt IntegerLiteralInst::getValue() const {
-  auto numBits = SILInstruction::Bits.IntegerLiteralInst.numBits;
+  auto numBits = SILNode::Bits.IntegerLiteralInst.numBits;
   return APInt(numBits, {getTrailingObjects<llvm::APInt::WordType>(),
                          getWordsForBitWidth(numBits)});
 }
@@ -967,7 +964,7 @@ APInt IntegerLiteralInst::getValue() const {
 FloatLiteralInst::FloatLiteralInst(SILDebugLocation Loc, SILType Ty,
                                    const APInt &Bits)
     : InstructionBase(Loc, Ty) {
-  SILInstruction::Bits.FloatLiteralInst.numBits = Bits.getBitWidth();
+  SILNode::Bits.FloatLiteralInst.numBits = Bits.getBitWidth();
   std::uninitialized_copy_n(Bits.getRawData(), Bits.getNumWords(),
                             getTrailingObjects<llvm::APInt::WordType>());
 }
@@ -999,7 +996,7 @@ FloatLiteralInst *FloatLiteralInst::create(FloatLiteralExpr *E,
 }
 
 APInt FloatLiteralInst::getBits() const {
-  auto numBits = SILInstruction::Bits.FloatLiteralInst.numBits;
+  auto numBits = SILNode::Bits.FloatLiteralInst.numBits;
   return APInt(numBits, {getTrailingObjects<llvm::APInt::WordType>(),
                          getWordsForBitWidth(numBits)});
 }
@@ -1012,8 +1009,8 @@ APFloat FloatLiteralInst::getValue() const {
 StringLiteralInst::StringLiteralInst(SILDebugLocation Loc, StringRef Text,
                                      Encoding encoding, SILType Ty)
     : InstructionBase(Loc, Ty) {
-  SILInstruction::Bits.StringLiteralInst.TheEncoding = unsigned(encoding);
-  SILInstruction::Bits.StringLiteralInst.Length = Text.size();
+  SILNode::Bits.StringLiteralInst.TheEncoding = unsigned(encoding);
+  SILNode::Bits.StringLiteralInst.Length = Text.size();
   memcpy(getTrailingObjects<char>(), Text.data(), Text.size());
 }
 
@@ -1043,14 +1040,14 @@ CondFailInst *CondFailInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 }
 
 uint64_t StringLiteralInst::getCodeUnitCount() {
-  return SILInstruction::Bits.StringLiteralInst.Length;
+  return SILNode::Bits.StringLiteralInst.Length;
 }
 
 StoreInst::StoreInst(
     SILDebugLocation Loc, SILValue Src, SILValue Dest,
     StoreOwnershipQualifier Qualifier = StoreOwnershipQualifier::Unqualified)
     : InstructionBase(Loc), Operands(this, Src, Dest) {
-  SILInstruction::Bits.StoreInst.OwnershipQualifier = unsigned(Qualifier);
+  SILNode::Bits.StoreInst.OwnershipQualifier = unsigned(Qualifier);
 }
 
 StoreBorrowInst::StoreBorrowInst(SILDebugLocation DebugLoc, SILValue Src,
@@ -1081,7 +1078,7 @@ StringRef swift::getSILAccessEnforcementName(SILAccessEnforcement enforcement) {
 AssignInst::AssignInst(SILDebugLocation Loc, SILValue Src, SILValue Dest,
                        AssignOwnershipQualifier Qualifier) :
     AssignInstBase(Loc, Src, Dest) {
-  SILInstruction::Bits.AssignInst.OwnershipQualifier = unsigned(Qualifier);
+  SILNode::Bits.AssignInst.OwnershipQualifier = unsigned(Qualifier);
 }
 
 AssignByWrapperInst::AssignByWrapperInst(SILDebugLocation Loc,
@@ -1091,7 +1088,7 @@ AssignByWrapperInst::AssignByWrapperInst(SILDebugLocation Loc,
                                           AssignOwnershipQualifier Qualifier) :
     AssignInstBase(Loc, Src, Dest, Initializer, Setter) {
   assert(Initializer->getType().is<SILFunctionType>());
-  SILInstruction::Bits.AssignByWrapperInst.OwnershipQualifier =
+  SILNode::Bits.AssignByWrapperInst.OwnershipQualifier =
       unsigned(Qualifier);
 }
 
@@ -1107,8 +1104,8 @@ CopyAddrInst::CopyAddrInst(SILDebugLocation Loc, SILValue SrcLValue,
                            SILValue DestLValue, IsTake_t isTakeOfSrc,
                            IsInitialization_t isInitializationOfDest)
     : InstructionBase(Loc), Operands(this, SrcLValue, DestLValue) {
-    SILInstruction::Bits.CopyAddrInst.IsTakeOfSrc = bool(isTakeOfSrc);
-    SILInstruction::Bits.CopyAddrInst.IsInitializationOfDest =
+    SILNode::Bits.CopyAddrInst.IsTakeOfSrc = bool(isTakeOfSrc);
+    SILNode::Bits.CopyAddrInst.IsInitializationOfDest =
       bool(isInitializationOfDest);
   }
 
@@ -1219,8 +1216,8 @@ StructInst::StructInst(SILDebugLocation Loc, SILType Ty,
                        ArrayRef<SILValue> Elems, bool HasOwnership)
     : InstructionBaseWithTrailingOperands(
           Elems, Loc, Ty,
-          HasOwnership ? *mergeSILValueOwnership(Elems)
-                       : ValueOwnershipKind(ValueOwnershipKind::None)) {
+          HasOwnership ? mergeSILValueOwnership(Elems)
+                       : ValueOwnershipKind(OwnershipKind::None)) {
   assert(!Ty.getStructOrBoundGenericStruct()->hasUnreferenceableStorage());
 }
 
@@ -1362,12 +1359,6 @@ VarDecl *swift::getIndexedField(NominalTypeDecl *decl, unsigned index) {
     index -= superDecl->getStoredProperties().size();
   }
   return nullptr;
-}
-
-unsigned FieldIndexCacheBase::cacheFieldIndex() {
-  unsigned index = ::getFieldIndex(getParentDecl(), getField());
-  SILInstruction::Bits.FieldIndexCacheBase.FieldIndex = index;
-  return index;
 }
 
 // FIXME: this should be cached during cacheFieldIndex().
@@ -1574,8 +1565,8 @@ CondBranchInst::CondBranchInst(SILDebugLocation Loc, SILValue Condition,
     : InstructionBaseWithTrailingOperands(Condition, Args, Loc),
       DestBBs{{{this, TrueBB, TrueBBCount}, {this, FalseBB, FalseBBCount}}} {
   assert(Args.size() == (NumTrue + NumFalse) && "Invalid number of args");
-  SILInstruction::Bits.CondBranchInst.NumTrueArgs = NumTrue;
-  assert(SILInstruction::Bits.CondBranchInst.NumTrueArgs == NumTrue &&
+  SILNode::Bits.CondBranchInst.NumTrueArgs = NumTrue;
+  assert(SILNode::Bits.CondBranchInst.NumTrueArgs == NumTrue &&
          "Truncation");
   assert(TrueBB != FalseBB && "Identical destinations");
 }
@@ -1659,7 +1650,7 @@ void CondBranchInst::swapSuccessors() {
 
   // Finally swap the number of arguments that we have. The number of false
   // arguments is derived from the number of true arguments, therefore:
-  SILInstruction::Bits.CondBranchInst.NumTrueArgs = getNumFalseArgs();
+  SILNode::Bits.CondBranchInst.NumTrueArgs = getNumFalseArgs();
 }
 
 SwitchValueInst::SwitchValueInst(SILDebugLocation Loc, SILValue Operand,
@@ -1667,7 +1658,7 @@ SwitchValueInst::SwitchValueInst(SILDebugLocation Loc, SILValue Operand,
                                  ArrayRef<SILValue> Cases,
                                  ArrayRef<SILBasicBlock *> BBs)
     : InstructionBaseWithTrailingOperands(Operand, Cases, Loc) {
-  SILInstruction::Bits.SwitchValueInst.HasDefault = bool(DefaultBB);
+  SILNode::Bits.SwitchValueInst.HasDefault = bool(DefaultBB);
   // Initialize the successor array.
   auto *succs = getSuccessorBuf();
   unsigned OperandBitWidth = 0;
@@ -1739,8 +1730,8 @@ SelectValueInst::SelectValueInst(SILDebugLocation DebugLoc, SILValue Operand,
                                  bool HasOwnership)
     : InstructionBaseWithTrailingOperands(
           Operand, CaseValuesAndResults, DebugLoc, Type,
-          HasOwnership ? *mergeSILValueOwnership(CaseValuesAndResults)
-                       : ValueOwnershipKind(ValueOwnershipKind::None)) {}
+          HasOwnership ? mergeSILValueOwnership(CaseValuesAndResults)
+                       : ValueOwnershipKind(OwnershipKind::None)) {}
 
 SelectValueInst *
 SelectValueInst::create(SILDebugLocation Loc, SILValue Operand, SILType Type,
@@ -1817,54 +1808,6 @@ SelectEnumAddrInst *SelectEnumAddrInst::create(
       false /*HasOwnership*/);
 }
 
-SwitchEnumInstBase::SwitchEnumInstBase(
-    SILInstructionKind Kind, SILDebugLocation Loc, SILValue Operand,
-    SILBasicBlock *DefaultBB,
-    ArrayRef<std::pair<EnumElementDecl *, SILBasicBlock *>> CaseBBs,
-    Optional<ArrayRef<ProfileCounter>> CaseCounts, ProfileCounter DefaultCount)
-    : TermInst(Kind, Loc), Operands(this, Operand) {
-  SILInstruction::Bits.SwitchEnumInstBase.HasDefault = bool(DefaultBB);
-  SILInstruction::Bits.SwitchEnumInstBase.NumCases = CaseBBs.size();
-  // Initialize the case and successor arrays.
-  auto *cases = getCaseBuf();
-  auto *succs = getSuccessorBuf();
-  for (unsigned i = 0, size = CaseBBs.size(); i < size; ++i) {
-    cases[i] = CaseBBs[i].first;
-    if (CaseCounts) {
-      ::new (succs + i)
-          SILSuccessor(this, CaseBBs[i].second, CaseCounts.getValue()[i]);
-    } else {
-      ::new (succs + i) SILSuccessor(this, CaseBBs[i].second);
-    }
-  }
-
-  if (hasDefault()) {
-    ::new (succs + getNumCases()) SILSuccessor(this, DefaultBB, DefaultCount);
-  }
-}
-
-void SwitchEnumInstBase::swapCase(unsigned i, unsigned j) {
-  assert(i < getNumCases() && "First index is out of bounds?!");
-  assert(j < getNumCases() && "Second index is out of bounds?!");
-
-  auto *succs = getSuccessorBuf();
-
-  // First grab our destination blocks.
-  SILBasicBlock *iBlock = succs[i].getBB();
-  SILBasicBlock *jBlock = succs[j].getBB();
-
-  // Then destroy the sil successors and reinitialize them with the new things
-  // that they are pointing at.
-  succs[i].~SILSuccessor();
-  ::new (succs + i) SILSuccessor(this, jBlock);
-  succs[j].~SILSuccessor();
-  ::new (succs + j) SILSuccessor(this, iBlock);
-
-  // Now swap our cases.
-  auto *cases = getCaseBuf();
-  std::swap(cases[i], cases[j]);
-}
-
 namespace {
   template <class Inst> EnumElementDecl *
   getUniqueCaseForDefaultValue(Inst *inst, SILValue enumValue) {
@@ -1927,20 +1870,13 @@ NullablePtr<EnumElementDecl> SelectEnumInstBase::getSingleTrueElement() const {
   return *TrueElement;
 }
 
-SwitchEnumInstBase::~SwitchEnumInstBase() {
-  // Destroy the successor records to keep the CFG up to date.
-  auto *succs = getSuccessorBuf();
-  for (unsigned i = 0, end = getNumCases() + hasDefault(); i < end; ++i) {
-    succs[i].~SILSuccessor();
-  }
-}
-
-template <typename SWITCH_ENUM_INST>
-SWITCH_ENUM_INST *SwitchEnumInstBase::createSwitchEnum(
+template <typename BaseTy>
+template <typename SWITCH_ENUM_INST, typename... RestTys>
+SWITCH_ENUM_INST *SwitchEnumInstBase<BaseTy>::createSwitchEnum(
     SILDebugLocation Loc, SILValue Operand, SILBasicBlock *DefaultBB,
     ArrayRef<std::pair<EnumElementDecl *, SILBasicBlock *>> CaseBBs,
     SILFunction &F, Optional<ArrayRef<ProfileCounter>> CaseCounts,
-    ProfileCounter DefaultCount) {
+    ProfileCounter DefaultCount, RestTys &&... restArgs) {
   // Allocate enough room for the instruction with tail-allocated
   // EnumElementDecl and SILSuccessor arrays. There are `CaseBBs.size()` decls
   // and `CaseBBs.size() + (DefaultBB ? 1 : 0)` successors.
@@ -1951,41 +1887,9 @@ SWITCH_ENUM_INST *SwitchEnumInstBase::createSwitchEnum(
       sizeof(SWITCH_ENUM_INST) + sizeof(EnumElementDecl *) * numCases +
           sizeof(SILSuccessor) * numSuccessors,
       alignof(SWITCH_ENUM_INST));
-  return ::new (buf) SWITCH_ENUM_INST(Loc, Operand, DefaultBB, CaseBBs,
-                                      CaseCounts, DefaultCount);
-}
-
-NullablePtr<EnumElementDecl> SwitchEnumInstBase::getUniqueCaseForDefault() {
-  return getUniqueCaseForDefaultValue(this, getOperand());
-}
-
-NullablePtr<EnumElementDecl>
-SwitchEnumInstBase::getUniqueCaseForDestination(SILBasicBlock *BB) {
-  SILValue value = getOperand();
-  SILType enumType = value->getType();
-  EnumDecl *decl = enumType.getEnumOrBoundGenericEnum();
-  assert(decl && "switch_enum operand is not an enum");
-  (void)decl;
-
-  EnumElementDecl *D = nullptr;
-  for (unsigned i = 0, e = getNumCases(); i != e; ++i) {
-    auto Entry = getCase(i);
-    if (Entry.second == BB) {
-      if (D != nullptr)
-        return nullptr;
-      D = Entry.first;
-    }
-  }
-  if (!D && hasDefault() && getDefaultBB() == BB) {
-    return getUniqueCaseForDefault();
-  }
-  return D;
-}
-
-NullablePtr<SILBasicBlock> SwitchEnumInstBase::getDefaultBBOrNull() const {
-  if (!hasDefault())
-    return nullptr;
-  return getDefaultBB();
+  return ::new (buf)
+      SWITCH_ENUM_INST(Loc, Operand, DefaultBB, CaseBBs, CaseCounts,
+                       DefaultCount, std::forward<RestTys>(restArgs)...);
 }
 
 SwitchEnumInst *SwitchEnumInst::create(
@@ -2179,7 +2083,7 @@ OpenExistentialRefInst::OpenExistentialRefInst(SILDebugLocation DebugLoc,
     : UnaryInstructionBase(DebugLoc, Operand, Ty,
                            HasOwnership
                                ? Operand.getOwnershipKind()
-                               : ValueOwnershipKind(ValueOwnershipKind::None)) {
+                               : ValueOwnershipKind(OwnershipKind::None)) {
   assert(Operand->getType().isObject() && "Operand must be an object.");
   assert(Ty.isObject() && "Result type must be an object type.");
 }
@@ -2196,13 +2100,13 @@ OpenExistentialBoxInst::OpenExistentialBoxInst(
 
 OpenExistentialBoxValueInst::OpenExistentialBoxValueInst(
     SILDebugLocation DebugLoc, SILValue operand, SILType ty)
-    : UnaryInstructionBase(DebugLoc, operand, ty) {
-}
+    : UnaryInstructionBase(DebugLoc, operand, ty, operand.getOwnershipKind()) {}
 
-OpenExistentialValueInst::OpenExistentialValueInst(SILDebugLocation DebugLoc,
-                                                     SILValue Operand,
-                                                     SILType SelfTy)
-    : UnaryInstructionBase(DebugLoc, Operand, SelfTy) {}
+OpenExistentialValueInst::OpenExistentialValueInst(SILDebugLocation debugLoc,
+                                                   SILValue operand,
+                                                   SILType selfTy)
+    : UnaryInstructionBase(debugLoc, operand, selfTy,
+                           operand.getOwnershipKind()) {}
 
 BeginCOWMutationInst::BeginCOWMutationInst(SILDebugLocation loc,
                                SILValue operand,
@@ -2222,7 +2126,8 @@ BeginCOWMutationInst::create(SILDebugLocation loc, SILValue operand,
                              SILType boolTy, SILFunction &F, bool isNative) {
 
   SILType resultTypes[2] = { boolTy, operand->getType() };
-  ValueOwnershipKind ownerships[2] = { ValueOwnershipKind::None, ValueOwnershipKind::Owned };
+  ValueOwnershipKind ownerships[2] = {OwnershipKind::None,
+                                      OwnershipKind::Owned};
 
   void *buffer =
     allocateTrailingInst<BeginCOWMutationInst,
@@ -2412,12 +2317,14 @@ UpcastInst *UpcastInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 
 ThinToThickFunctionInst *
 ThinToThickFunctionInst::create(SILDebugLocation DebugLoc, SILValue Operand,
-                                SILType Ty, SILFunction &F,
+                                SILType Ty, SILModule &Mod, SILFunction *F,
                                 SILOpenedArchetypesState &OpenedArchetypes) {
-  SILModule &Mod = F.getModule();
   SmallVector<SILValue, 8> TypeDependentOperands;
-  collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, F,
-                               Ty.getASTType());
+  if (F) {
+    assert(&F->getModule() == &Mod);
+    collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, *F,
+                                 Ty.getASTType());
+  }
   unsigned size =
     totalSizeToAlloc<swift::Operand>(1 + TypeDependentOperands.size());
   void *Buffer = Mod.allocateInst(size, alignof(ThinToThickFunctionInst));
@@ -2441,12 +2348,15 @@ PointerToThinFunctionInst::create(SILDebugLocation DebugLoc, SILValue Operand,
 }
 
 ConvertFunctionInst *ConvertFunctionInst::create(
-    SILDebugLocation DebugLoc, SILValue Operand, SILType Ty, SILFunction &F,
+    SILDebugLocation DebugLoc, SILValue Operand, SILType Ty, SILModule &Mod,
+    SILFunction *F,
     SILOpenedArchetypesState &OpenedArchetypes, bool WithoutActuallyEscaping) {
-  SILModule &Mod = F.getModule();
   SmallVector<SILValue, 8> TypeDependentOperands;
-  collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, F,
-                               Ty.getASTType());
+  if (F) {
+    assert(&F->getModule() == &Mod);
+    collectTypeDependentOperands(TypeDependentOperands, OpenedArchetypes, *F,
+                                 Ty.getASTType());
+  }
   unsigned size =
     totalSizeToAlloc<swift::Operand>(1 + TypeDependentOperands.size());
   void *Buffer = Mod.allocateInst(size, alignof(ConvertFunctionInst));
@@ -2457,14 +2367,14 @@ ConvertFunctionInst *ConvertFunctionInst::create(
   //
   // *NOTE* We purposely do not use an early return here to ensure that in
   // builds without assertions this whole if statement is optimized out.
-  if (F.getModule().getStage() != SILStage::Lowered) {
+  if (Mod.getStage() != SILStage::Lowered) {
     // Make sure we are not performing ABI-incompatible conversions.
     CanSILFunctionType opTI =
         CFI->getOperand()->getType().castTo<SILFunctionType>();
     (void)opTI;
     CanSILFunctionType resTI = CFI->getType().castTo<SILFunctionType>();
     (void)resTI;
-    assert(opTI->isABICompatibleWith(resTI, F).isCompatible() &&
+    assert((!F || opTI->isABICompatibleWith(resTI, *F).isCompatible()) &&
            "Can not convert in between ABI incompatible function types");
   }
   return CFI;
@@ -2931,11 +2841,6 @@ DestructureTupleInst *DestructureTupleInst::create(const SILFunction &F,
       DestructureTupleInst(M, Loc, Operand, Types, OwnershipKinds);
 }
 
-CanType GetAsyncContinuationInstBase::getFormalResumeType() const {
-  // The resume type is the type argument to the continuation type.
-  return getType().castTo<BoundGenericType>().getGenericArgs()[0];
-}
-
 SILType GetAsyncContinuationInstBase::getLoweredResumeType() const {
   // The lowered resume type is the maximally-abstracted lowering of the
   // formal resume type.
@@ -2945,8 +2850,30 @@ SILType GetAsyncContinuationInstBase::getLoweredResumeType() const {
   return M.Types.getLoweredType(AbstractionPattern::getOpaque(), formalType, c);
 }
 
-bool GetAsyncContinuationInstBase::throws() const {
-  // The continuation throws if it's an UnsafeThrowingContinuation
-  return getType().castTo<BoundGenericType>()->getDecl()
-    == getFunction()->getASTContext().getUnsafeThrowingContinuationDecl();
+ReturnInst::ReturnInst(SILFunction &func, SILDebugLocation debugLoc,
+                       SILValue returnValue)
+    : UnaryInstructionBase(debugLoc, returnValue),
+      ownershipKind(OwnershipKind::None) {
+  // If we have a trivial value, leave our ownership kind as none.
+  if (returnValue->getType().isTrivial(func))
+    return;
+
+  SILFunctionConventions fnConv = func.getConventions();
+
+  // If we do not have any direct SIL results, we should accept a tuple
+  // argument, meaning that we should have a none ownership kind.
+  auto results = fnConv.getDirectSILResults();
+  if (results.empty())
+    return;
+
+  auto ownershipKindRange =
+      makeTransformRange(results, [&](const SILResultInfo &info) {
+        return info.getOwnershipKind(func, func.getLoweredFunctionType());
+      });
+
+  // Then merge all of our ownership kinds. Assert if we fail to merge.
+  ownershipKind = ValueOwnershipKind::merge(ownershipKindRange);
+  assert(ownershipKind &&
+         "Conflicting ownership kinds when creating term inst from function "
+         "result info?!");
 }

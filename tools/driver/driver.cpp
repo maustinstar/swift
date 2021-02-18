@@ -75,6 +75,10 @@ extern int swift_indent_main(ArrayRef<const char *> Args, const char *Argv0,
 extern int swift_symbolgraph_extract_main(ArrayRef<const char *> Args, const char *Argv0,
 void *MainAddr);
 
+/// Run 'swift-api-extract'
+extern int swift_api_extract_main(ArrayRef<const char *> Args,
+                                  const char *Argv0, void *MainAddr);
+
 /// Determine if the given invocation should run as a "subcommand".
 ///
 /// Examples of "subcommands" are 'swift build' or 'swift test', which are
@@ -104,8 +108,8 @@ static bool shouldRunAsSubcommand(StringRef ExecName,
   // Otherwise, we have a program argument. If it looks like an option or a
   // path, then invoke in interactive mode with the arguments as given.
   StringRef FirstArg(Args[1]);
-  if (FirstArg.startswith("-") || FirstArg.find('.') != StringRef::npos ||
-      FirstArg.find('/') != StringRef::npos)
+  if (FirstArg.startswith("-") || FirstArg.contains('.') ||
+      FirstArg.contains('/'))
     return false;
 
   // Otherwise, we should have some sort of subcommand. Get the subcommand name
@@ -124,6 +128,24 @@ static bool shouldRunAsSubcommand(StringRef ExecName,
   SubcommandName.append(Subcommand);
 
   return true;
+}
+
+static bool shouldDisallowNewDriver(StringRef ExecName,
+                                    const ArrayRef<const char *> argv) {
+  // We are not invoking the driver, so don't forward.
+  if (ExecName != "swift" && ExecName != "swiftc") {
+    return true;
+  }
+  // If user specified using the old driver, don't forward.
+  if (llvm::find_if(argv, [](const char* arg) {
+    return StringRef(arg) == "-disallow-use-new-driver";
+  }) != argv.end()) {
+    return true;
+  }
+  if (llvm::sys::Process::GetEnv("SWIFT_USE_OLD_DRIVER").hasValue()) {
+    return true;
+  }
+  return false;
 }
 
 static int run_driver(StringRef ExecName,
@@ -160,33 +182,44 @@ static int run_driver(StringRef ExecName,
   DiagnosticEngine Diags(SM);
   Diags.addConsumer(PDC);
 
+  std::string newDriverName = "swift-driver-new";
+  if (auto driverNameOp = llvm::sys::Process::GetEnv("SWIFT_USE_NEW_DRIVER")) {
+    newDriverName = driverNameOp.getValue();
+  }
   // Forwarding calls to the swift driver if the C++ driver is invoked as `swift`
   // or `swiftc`, and an environment variable SWIFT_USE_NEW_DRIVER is defined.
-  if (llvm::sys::Process::GetEnv("SWIFT_USE_NEW_DRIVER") &&
-      (ExecName == "swift" || ExecName == "swiftc")) {
+  if (!shouldDisallowNewDriver(ExecName, argv)) {
     SmallString<256> NewDriverPath(llvm::sys::path::parent_path(Path));
-    llvm::sys::path::append(NewDriverPath, "swift-driver");
-    SmallVector<const char *, 256> subCommandArgs;
-    // Rewrite the program argument.
-    subCommandArgs.push_back(NewDriverPath.c_str());
-    if (ExecName == "swiftc") {
-      subCommandArgs.push_back("--driver-mode=swiftc");
-    } else {
-      assert(ExecName == "swift");
-      subCommandArgs.push_back("--driver-mode=swift");
+    llvm::sys::path::append(NewDriverPath, newDriverName);
+    if (llvm::sys::fs::exists(NewDriverPath)) {
+      SmallVector<const char *, 256> subCommandArgs;
+      // Rewrite the program argument.
+      subCommandArgs.push_back(NewDriverPath.c_str());
+      if (ExecName == "swiftc") {
+        subCommandArgs.push_back("--driver-mode=swiftc");
+      } else {
+        assert(ExecName == "swift");
+        subCommandArgs.push_back("--driver-mode=swift");
+      }
+      subCommandArgs.insert(subCommandArgs.end(), argv.begin() + 1, argv.end());
+
+      // Push these non-op frontend arguments so the build log can indicate
+      // the new driver is used.
+      subCommandArgs.push_back("-Xfrontend");
+      subCommandArgs.push_back("-new-driver-path");
+      subCommandArgs.push_back("-Xfrontend");
+      subCommandArgs.push_back(NewDriverPath.c_str());
+
+      // Execute the subcommand.
+      subCommandArgs.push_back(nullptr);
+      ExecuteInPlace(NewDriverPath.c_str(), subCommandArgs.data());
+
+      // If we reach here then an error occurred (typically a missing path).
+      std::string ErrorString = llvm::sys::StrError();
+      llvm::errs() << "error: unable to invoke subcommand: " << subCommandArgs[0]
+                   << " (" << ErrorString << ")\n";
+      return 2;
     }
-    subCommandArgs.insert(subCommandArgs.end(), argv.begin() + 1, argv.end());
-
-    // Execute the subcommand.
-    subCommandArgs.push_back(nullptr);
-    Diags.diagnose(SourceLoc(), diag::remark_forwarding_to_new_driver);
-    ExecuteInPlace(NewDriverPath.c_str(), subCommandArgs.data());
-
-    // If we reach here then an error occurred (typically a missing path).
-    std::string ErrorString = llvm::sys::StrError();
-    llvm::errs() << "error: unable to invoke subcommand: " << subCommandArgs[0]
-                 << " (" << ErrorString << ")\n";
-    return 2;
   }
 
   Driver TheDriver(Path, ExecName, argv, Diags);
@@ -201,6 +234,10 @@ static int run_driver(StringRef ExecName,
       argv[0], (void *)(intptr_t)getExecutablePath);
   case Driver::DriverKind::SymbolGraph:
       return swift_symbolgraph_extract_main(TheDriver.getArgsWithoutProgramNameAndDriverMode(argv), argv[0], (void *)(intptr_t)getExecutablePath);
+  case Driver::DriverKind::APIExtract:
+    return swift_api_extract_main(
+        TheDriver.getArgsWithoutProgramNameAndDriverMode(argv), argv[0],
+        (void *)(intptr_t)getExecutablePath);
   default:
     break;
   }
@@ -224,7 +261,7 @@ static int run_driver(StringRef ExecName,
     std::unique_ptr<sys::TaskQueue> TQ = TheDriver.buildTaskQueue(*C);
     if (!TQ)
         return 1;
-    return C->performJobs(std::move(TQ));
+    return C->performJobs(std::move(TQ)).exitCode;
   }
 
   return 0;
@@ -246,9 +283,8 @@ int main(int argc_, const char **argv_) {
   }
 
   std::vector<const char *> utf8CStrs;
-  std::transform(utf8Args.begin(), utf8Args.end(),
-                 std::back_inserter(utf8CStrs),
-                 std::mem_fn(&std::string::c_str));
+  llvm::transform(utf8Args, std::back_inserter(utf8CStrs),
+                  std::mem_fn(&std::string::c_str));
   argv_ = utf8CStrs.data();
 #endif
   // Expand any response files in the command line argument vector - arguments
@@ -257,12 +293,7 @@ int main(int argc_, const char **argv_) {
   SmallVector<const char *, 256> ExpandedArgs(&argv_[0], &argv_[argc_]);
   llvm::BumpPtrAllocator Allocator;
   llvm::StringSaver Saver(Allocator);
-  llvm::cl::ExpandResponseFiles(
-      Saver,
-      llvm::Triple(llvm::sys::getProcessTriple()).isOSWindows()
-          ? llvm::cl::TokenizeWindowsCommandLine
-          : llvm::cl::TokenizeGNUCommandLine,
-      ExpandedArgs);
+  swift::driver::ExpandResponseFilesWithRetry(Saver, ExpandedArgs);
 
   // Initialize the stack trace using the parsed argument vector with expanded
   // response files.

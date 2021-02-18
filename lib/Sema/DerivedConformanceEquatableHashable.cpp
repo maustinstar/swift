@@ -387,6 +387,7 @@ deriveEquatable_eq(
                                     C.getIdentifier(s), parentDC);
     param->setSpecifier(ParamSpecifier::Default);
     param->setInterfaceType(selfIfaceTy);
+    param->setImplicit();
     return param;
   };
 
@@ -537,6 +538,7 @@ deriveHashable_hashInto(
                                             C.Id_hasher, parentDC);
   hasherParamDecl->setSpecifier(ParamSpecifier::InOut);
   hasherParamDecl->setInterfaceType(hasherType);
+  hasherParamDecl->setImplicit();
 
   ParameterList *params = ParameterList::createWithoutLoc(hasherParamDecl);
 
@@ -552,7 +554,8 @@ deriveHashable_hashInto(
       /*GenericParams=*/nullptr, params, returnType, parentDC);
   hashDecl->setBodySynthesizer(bodySynthesizer);
 
-  hashDecl->copyFormalAccessFrom(derived.Nominal);
+  hashDecl->copyFormalAccessFrom(derived.Nominal,
+                                 /*sourceIsParentContext=*/true);
 
   derived.addMembersToConformanceContext({hashDecl});
 
@@ -881,6 +884,7 @@ static ValueDecl *deriveHashable_hashValue(DerivedConformance &derived) {
     new (C) VarDecl(/*IsStatic*/false, VarDecl::Introducer::Var,
                     SourceLoc(), C.Id_hashValue, parentDC);
   hashValueDecl->setInterfaceType(intType);
+  hashValueDecl->setSynthesized();
 
   ParameterList *params = ParameterList::createEmpty(C);
 
@@ -893,6 +897,7 @@ static ValueDecl *deriveHashable_hashValue(DerivedConformance &derived) {
       intType, parentDC);
   getterDecl->setImplicit();
   getterDecl->setBodySynthesizer(&deriveBodyHashable_hashValue);
+  getterDecl->setSynthesized();
   getterDecl->setIsTransparent(false);
 
   getterDecl->copyFormalAccessFrom(derived.Nominal,

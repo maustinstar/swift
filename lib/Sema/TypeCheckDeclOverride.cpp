@@ -728,10 +728,22 @@ static bool isNSObjectHashValue(ValueDecl *baseDecl) {
   if (auto baseVar = dyn_cast<VarDecl>(baseDecl)) {
     if (auto classDecl = baseVar->getDeclContext()->getSelfClassDecl()) {
       return baseVar->getName() == ctx.Id_hashValue &&
-        classDecl->getName().is("NSObject") &&
-        (classDecl->getModuleContext()->getName() == ctx.Id_Foundation ||
-         classDecl->getModuleContext()->getName() == ctx.Id_ObjectiveC);
+             classDecl->isNSObject();
     }
+  }
+  return false;
+}
+
+/// Returns true if the given declaration is for the `NSObject.hash(into:)`
+/// function.
+static bool isNSObjectHashMethod(ValueDecl *baseDecl) {
+  auto baseFunc = dyn_cast<FuncDecl>(baseDecl);
+  if (!baseFunc)
+    return false;
+
+  if (auto classDecl = baseFunc->getDeclContext()->getSelfClassDecl()) {
+    ASTContext &ctx = baseDecl->getASTContext();
+    return baseFunc->getBaseName() == ctx.Id_hash && classDecl->isNSObject();
   }
   return false;
 }
@@ -997,11 +1009,15 @@ static void checkOverrideAccessControl(ValueDecl *baseDecl, ValueDecl *decl,
       !baseHasOpenAccess &&
       baseDecl->getModuleContext() != decl->getModuleContext() &&
       !isa<ConstructorDecl>(decl)) {
-    // NSObject.hashValue was made non-overridable in Swift 5; one should
-    // override NSObject.hash instead.
+    // NSObject.hashValue and NSObject.hash(into:) are not overridable;
+    // one should override NSObject.hash instead.
     if (isNSObjectHashValue(baseDecl)) {
-      diags.diagnose(decl, diag::override_nsobject_hashvalue_error)
+      decl->diagnose(diag::override_nsobject_hashvalue_error)
         .fixItReplace(SourceRange(decl->getNameLoc()), "hash");
+    } else if (isNSObjectHashMethod(baseDecl)) {
+      decl->diagnose(diag::override_nsobject_hash_error)
+        .fixItReplace(cast<FuncDecl>(decl)->getFuncLoc(), getTokenText(tok::kw_var))
+        .fixItReplace(cast<FuncDecl>(decl)->getParameters()->getSourceRange(), ": Int");
     } else {
       diags.diagnose(decl, diag::override_of_non_open,
                      decl->getDescriptiveKind());
@@ -1517,6 +1533,13 @@ namespace  {
     UNINTERESTING_ATTR(ActorIndependent)
     UNINTERESTING_ATTR(GlobalActor)
     UNINTERESTING_ATTR(Async)
+    UNINTERESTING_ATTR(Concurrent)
+
+    UNINTERESTING_ATTR(AtRethrows)
+    UNINTERESTING_ATTR(Marker)
+
+    UNINTERESTING_ATTR(AtReasync)
+
 #undef UNINTERESTING_ATTR
 
     void visitAvailableAttr(AvailableAttr *attr) {
@@ -1531,6 +1554,16 @@ namespace  {
       if (!Override->getAttrs().hasAttribute<RethrowsAttr>() &&
           cast<AbstractFunctionDecl>(Override)->hasThrows()) {
         Diags.diagnose(Override, diag::override_rethrows_with_non_rethrows,
+                       isa<ConstructorDecl>(Override));
+        Diags.diagnose(Base, diag::overridden_here);
+      }
+    }
+
+    void visitReasyncAttr(ReasyncAttr *attr) {
+      // 'reasync' functions are a subtype of ordinary 'async' functions.
+      // Require 'reasync' on the override if it was there on the base.
+      if (!Override->getAttrs().hasAttribute<ReasyncAttr>()) {
+        Diags.diagnose(Override, diag::override_reasync_with_non_reasync,
                        isa<ConstructorDecl>(Override));
         Diags.diagnose(Base, diag::overridden_here);
       }
@@ -1793,16 +1826,20 @@ static bool checkSingleOverride(ValueDecl *override, ValueDecl *base) {
       (isa<ExtensionDecl>(base->getDeclContext()) ||
        isa<ExtensionDecl>(override->getDeclContext())) &&
       !base->isObjC()) {
-    // Suppress this diagnostic for overrides of a non-open NSObject.hashValue
-    // property; these are diagnosed elsewhere. An error message complaining
+    // Suppress this diagnostic for overrides of non-open NSObject.Hashable
+    // interfaces; these are diagnosed elsewhere. An error message complaining
     // about extensions would be misleading in this case; the correct fix is to
     // override NSObject.hash instead.
-    if (isNSObjectHashValue(base) && 
+    if ((isNSObjectHashValue(base) || isNSObjectHashMethod(base)) &&
         !base->hasOpenAccess(override->getDeclContext()))
       return true;
+
     bool baseCanBeObjC = canBeRepresentedInObjC(base);
+    auto nominal = base->getDeclContext()->getSelfNominalTypeDecl();
     diags.diagnose(override, diag::override_decl_extension, baseCanBeObjC,
-                   !isa<ExtensionDecl>(base->getDeclContext()));
+                   !isa<ExtensionDecl>(base->getDeclContext()),
+                   override->getDescriptiveKind(), override->getName(),
+                   nominal->getName());
     // If the base and the override come from the same module, try to fix
     // the base declaration. Otherwise we can wind up diagnosing into e.g. the
     // SDK overlay modules.

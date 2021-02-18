@@ -69,7 +69,7 @@ class TypeSubstCloner : public SILClonerWithScopes<ImplClass> {
 
       if (!Cloner.Inlining) {
         FunctionRefInst *FRI = dyn_cast<FunctionRefInst>(AI.getCallee());
-        if (FRI && FRI->getInitiallyReferencedFunction() == AI.getFunction() &&
+        if (FRI && FRI->getReferencedFunction() == AI.getFunction() &&
             Subs == Cloner.SubsMap) {
           // Handle recursions by replacing the apply to the callee with an
           // apply to the newly specialized function, but only if substitutions
@@ -137,7 +137,6 @@ public:
   using SILClonerWithScopes<ImplClass>::getOpBasicBlock;
   using SILClonerWithScopes<ImplClass>::recordClonedInstruction;
   using SILClonerWithScopes<ImplClass>::recordFoldedValue;
-  using SILClonerWithScopes<ImplClass>::addBlockWithUnreachable;
   using SILClonerWithScopes<ImplClass>::OpenedArchetypesTracker;
 
   TypeSubstCloner(SILFunction &To,
@@ -428,9 +427,10 @@ protected:
       return ParentFunction;
 
     // Clone the function with the substituted type for the debug info.
-    Mangle::GenericSpecializationMangler Mangler(
-        ParentFunction, SubsMap, IsNotSerialized, false, ForInlining);
-    std::string MangledName = Mangler.mangle(RemappedSig);
+    Mangle::GenericSpecializationMangler Mangler(ParentFunction,
+                                                 IsNotSerialized);
+    std::string MangledName =
+      Mangler.mangleForDebugInfo(RemappedSig, SubsMap, ForInlining);
 
     if (ParentFunction->getName() == MangledName)
       return ParentFunction;

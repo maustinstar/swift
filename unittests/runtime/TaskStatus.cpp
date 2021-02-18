@@ -40,7 +40,7 @@ using undeduced =
 template <class T>
 SWIFT_CC(swift)
 static void simpleTaskInvokeFunction(AsyncTask *task, ExecutorRef executor,
-                                     AsyncContext *context) {
+                                     SWIFT_ASYNC_CONTEXT AsyncContext *context) {
   auto valueContext = static_cast<ValueContext<T>*>(context);
   valueContext->StoredInvokeFn(task, executor, valueContext);
 
@@ -80,7 +80,7 @@ static void withSimpleTask(T &&value,
 }
 
 static ExecutorRef createFakeExecutor(uintptr_t value) {
-  return {reinterpret_cast<Executor*>(value)};
+  return ExecutorRef::forDefaultActor(reinterpret_cast<DefaultActor*>(value));
 }
 
 } // end anonymous namespace

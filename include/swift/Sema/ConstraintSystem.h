@@ -34,6 +34,7 @@
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintGraphScope.h"
 #include "swift/Sema/ConstraintLocator.h"
+#include "swift/Sema/CSBindings.h"
 #include "swift/Sema/CSFix.h"
 #include "swift/Sema/OverloadChoice.h"
 #include "swift/Sema/SolutionResult.h"
@@ -50,6 +51,8 @@
 #include <cstddef>
 #include <functional>
 
+using namespace swift::constraints::inference;
+
 namespace swift {
 
 class Expr;
@@ -65,12 +68,6 @@ class ConstraintSystem;
 class SolutionApplicationTarget;
 
 } // end namespace constraints
-
-namespace unittest {
-
-class SemaTest;
-
-} // end namespace unittest
 
 // Forward declare some TypeChecker related functions
 // so they could be made friends of ConstraintSystem.
@@ -785,6 +782,8 @@ enum ScoreKind {
   SK_ForwardTrailingClosure,
   /// A use of a disfavored overload.
   SK_DisfavoredOverload,
+  /// A member for an \c UnresolvedMemberExpr found via unwrapped optional base.
+  SK_UnresolvedMemberViaOptional,
   /// An implicit force of an implicitly unwrapped optional value.
   SK_ForceUnchecked,
   /// A user-defined conversion.
@@ -1181,9 +1180,6 @@ public:
   llvm::SmallMapVector<const CaseLabelItem *, CaseLabelItemInfo, 4>
       caseLabelItems;
 
-  std::vector<std::pair<ConstraintLocator *, ProtocolConformanceRef>>
-      Conformances;
-
   /// The set of functions that have been transformed by a result builder.
   llvm::MapVector<AnyFunctionRef, AppliedBuilderTransform>
       resultBuilderTransformed;
@@ -1258,11 +1254,6 @@ public:
       return known->second;
     return None;
   }
-
-  /// Retrieve a fully-resolved protocol conformance at the given locator
-  /// and with the given protocol.
-  ProtocolConformanceRef resolveConformance(ConstraintLocator *locator,
-                                            ProtocolDecl *proto);
 
   ConstraintLocator *getCalleeLocator(ConstraintLocator *locator,
                                       bool lookThroughApply = true) const;
@@ -1384,6 +1375,17 @@ enum class ConstraintSystemFlags {
   /// CodeCompletionExpr, and should continue in the presence of errors wherever
   /// possible.
   ForCodeCompletion = 0x40,
+
+  /// Include Clang function types when checking equality for function types.
+  ///
+  /// When LangOptions.UseClangFunctionTypes is set, we can synthesize
+  /// different @convention(c) function types with the same parameter and result
+  /// types (similarly for blocks). This difference is reflected in the `cType:`
+  /// field (@convention(c, cType: ...)). When the cType is different, the types
+  /// should be treated as semantically different, as they may have different
+  /// calling conventions, say due to Clang attributes such as
+  /// `__attribute__((ns_consumed))`.
+  UseClangFunctionTypes = 0x80,
 };
 
 /// Options that affect the constraint system as a whole.
@@ -2024,8 +2026,6 @@ enum class SolutionApplicationToFunctionResult {
 class ConstraintSystem {
   ASTContext &Context;
 
-  friend class swift::unittest::SemaTest;
-
 public:
   DeclContext *DC;
   ConstraintSystemOptions Options;
@@ -2175,6 +2175,11 @@ private:
   std::vector<std::pair<ConstraintLocator*, unsigned>>
       DisjunctionChoices;
 
+  /// A map from applied disjunction constraints to the corresponding
+  /// argument function type.
+  llvm::SmallMapVector<ConstraintLocator *, const FunctionType *, 4>
+      AppliedDisjunctions;
+
   /// For locators associated with call expressions, the trailing closure
   /// matching rule that was applied.
   std::vector<std::pair<ConstraintLocator*, TrailingClosureMatching>>
@@ -2214,9 +2219,6 @@ private:
   /// The nodes for which we have produced types, along with the prior type
   /// each node had before introducing this type.
   llvm::SmallVector<std::pair<ASTNode, Type>, 8> addedNodeTypes;
-
-  std::vector<std::pair<ConstraintLocator *, ProtocolConformanceRef>>
-      CheckedConformances;
 
   /// The set of functions that have been transformed by a result builder.
   std::vector<std::pair<AnyFunctionRef, AppliedBuilderTransform>>
@@ -2667,6 +2669,9 @@ public:
     /// The length of \c DisjunctionChoices.
     unsigned numDisjunctionChoices;
 
+    /// The length of \c AppliedDisjunctions.
+    unsigned numAppliedDisjunctions;
+
     /// The length of \c trailingClosureMatchingChoices;
     unsigned numTrailingClosureMatchingChoices;
 
@@ -2680,8 +2685,6 @@ public:
     unsigned numDefaultedConstraints;
 
     unsigned numAddedNodeTypes;
-
-    unsigned numCheckedConformances;
 
     unsigned numDisabledConstraints;
 
@@ -2782,7 +2785,7 @@ private:
   void
   filterSolutions(SmallVectorImpl<Solution> &solutions,
                   bool minimize = false) {
-    if (solutions.size() < 2)
+    if (solutions.size() < 2 || isForCodeCompletion())
       return;
 
     if (auto best = findBestSolution(solutions, minimize)) {
@@ -2844,6 +2847,10 @@ public:
   bool isActiveTypeVariable(TypeVariableType *typeVar) const {
     return TypeVariables.count(typeVar) > 0;
   }
+
+  /// Whether the given expression's source range contains the code
+  /// completion location.
+  bool containsCodeCompletionLoc(Expr *expr) const;
 
   void setClosureType(const ClosureExpr *closure, FunctionType *type) {
     assert(closure);
@@ -3134,9 +3141,15 @@ public:
         });
   }
 
-  /// Determine whether given declaration is unavailable in the current context.
+  /// Determine whether the given declaration is unavailable from the
+  /// current context.
   bool isDeclUnavailable(const Decl *D,
                          ConstraintLocator *locator = nullptr) const;
+
+  /// Determine whether the given conformance is unavailable from the
+  /// current context.
+  bool isConformanceUnavailable(ProtocolConformanceRef conformance,
+                                ConstraintLocator *locator = nullptr) const;
 
 public:
 
@@ -3881,12 +3894,6 @@ public:
                           const DeclRefExpr *base = nullptr,
                           OpenedTypeMap *replacements = nullptr);
 
-  /// Retrieve a list of conformances established along the current solver path.
-  ArrayRef<std::pair<ConstraintLocator *, ProtocolConformanceRef>>
-  getCheckedConformances() const {
-    return CheckedConformances;
-  }
-
   /// Retrieve a list of generic parameter types solver has "opened" (replaced
   /// with a type variable) along the current path.
   ArrayRef<std::pair<ConstraintLocator *, ArrayRef<OpenedType>>>
@@ -4613,376 +4620,14 @@ public:
       ConstraintKind bodyResultConstraintKind,
       ConstraintLocatorBuilder locator);
 
-private:
-  /// The kind of bindings that are permitted.
-  enum class AllowedBindingKind : uint8_t {
-    /// Only the exact type.
-    Exact,
-    /// Supertypes of the specified type.
-    Supertypes,
-    /// Subtypes of the specified type.
-    Subtypes
-  };
-
-  /// The kind of literal binding found.
-  enum class LiteralBindingKind : uint8_t {
-    None,
-    Collection,
-    Float,
-    Atom,
-  };
-
-  /// A potential binding from the type variable to a particular type,
-  /// along with information that can be used to construct related
-  /// bindings, e.g., the supertypes of a given type.
-  struct PotentialBinding {
-    /// The type to which the type variable can be bound.
-    Type BindingType;
-
-    /// The kind of bindings permitted.
-    AllowedBindingKind Kind;
-
-  protected:
-    /// The source of the type information.
-    ///
-    /// Determines whether this binding represents a "hole" in
-    /// constraint system. Such bindings have no originating constraint
-    /// because they are synthetic, they have a locator instead.
-    PointerUnion<Constraint *, ConstraintLocator *> BindingSource;
-
-    PotentialBinding(Type type, AllowedBindingKind kind,
-                     PointerUnion<Constraint *, ConstraintLocator *> source)
-        : BindingType(type->getWithoutParens()), Kind(kind),
-          BindingSource(source) {}
-
-  public:
-    PotentialBinding(Type type, AllowedBindingKind kind, Constraint *source)
-        : BindingType(type->getWithoutParens()), Kind(kind),
-          BindingSource(source) {}
-
-    bool isDefaultableBinding() const {
-      if (auto *constraint = BindingSource.dyn_cast<Constraint *>())
-        return constraint->getKind() == ConstraintKind::Defaultable;
-      // If binding source is not constraint - it's a hole, which is
-      // a last resort default binding for a type variable.
-      return true;
-    }
-
-    bool hasDefaultedLiteralProtocol() const {
-      return bool(getDefaultedLiteralProtocol());
-    }
-
-    ProtocolDecl *getDefaultedLiteralProtocol() const {
-      auto *constraint = BindingSource.dyn_cast<Constraint *>();
-      if (!constraint)
-        return nullptr;
-
-      return constraint->getKind() == ConstraintKind::LiteralConformsTo
-                 ? constraint->getProtocol()
-                 : nullptr;
-    }
-
-    ConstraintLocator *getLocator() const {
-      if (auto *constraint = BindingSource.dyn_cast<Constraint *>())
-        return constraint->getLocator();
-      return BindingSource.get<ConstraintLocator *>();
-    }
-
-    PotentialBinding withType(Type type) const {
-      return {type, Kind, BindingSource};
-    }
-
-    PotentialBinding withSameSource(Type type, AllowedBindingKind kind) const {
-      return {type, kind, BindingSource};
-    }
-
-    static PotentialBinding forHole(TypeVariableType *typeVar,
-                                    ConstraintLocator *locator) {
-      return {HoleType::get(typeVar->getASTContext(), typeVar),
-              AllowedBindingKind::Exact,
-              /*source=*/locator};
-    }
-  };
-
-  struct PotentialBindings {
-    using BindingScore =
-        std::tuple<bool, bool, bool, bool, bool, unsigned char, int>;
-
-    TypeVariableType *TypeVar;
-
-    /// The set of potential bindings.
-    SmallVector<PotentialBinding, 4> Bindings;
-
-    /// The set of protocol requirements placed on this type variable.
-    llvm::SmallVector<Constraint *, 4> Protocols;
-
-    /// The set of transitive protocol requirements inferred through
-    /// subtype/conversion/equivalence relations with other type variables.
-    Optional<llvm::SmallPtrSet<Constraint *, 4>> TransitiveProtocols;
-
-    /// The set of constraints which would be used to infer default types.
-    llvm::TinyPtrVector<Constraint *> Defaults;
-
-    /// Whether these bindings should be delayed until the rest of the
-    /// constraint system is considered "fully bound".
-    bool FullyBound = false;
-
-    /// Whether the bindings of this type involve other type variables.
-    bool InvolvesTypeVariables = false;
-
-    /// Whether this type variable is considered a hole in the constraint system.
-    bool IsHole = false;
-
-    /// Whether the bindings represent (potentially) incomplete set,
-    /// there is no way to say with absolute certainty if that's the
-    /// case, but that could happen when certain constraints like
-    /// `bind param` are present in the system.
-    bool PotentiallyIncomplete = false;
-
-    ASTNode AssociatedCodeCompletionToken = ASTNode();
-
-    /// Whether this type variable has literal bindings.
-    LiteralBindingKind LiteralBinding = LiteralBindingKind::None;
-
-    /// Whether this type variable is only bound above by existential types.
-    bool SubtypeOfExistentialType = false;
-
-    /// The number of defaultable bindings.
-    unsigned NumDefaultableBindings = 0;
-
-    /// Tracks the position of the last known supertype in the group.
-    Optional<unsigned> lastSupertypeIndex;
-
-    /// A set of all not-yet-resolved type variables this type variable
-    /// is a subtype of, supertype of or is equivalent to. This is used
-    /// to determine ordering inside of a chain of subtypes to help infer
-    /// transitive bindings  and protocol requirements.
-    llvm::SmallMapVector<TypeVariableType *, Constraint *, 4> SubtypeOf;
-    llvm::SmallMapVector<TypeVariableType *, Constraint *, 4> SupertypeOf;
-    llvm::SmallMapVector<TypeVariableType *, Constraint *, 4> EquivalentTo;
-
-    PotentialBindings(TypeVariableType *typeVar)
-        : TypeVar(typeVar), PotentiallyIncomplete(isGenericParameter()) {}
-
-    /// Determine whether the set of bindings is non-empty.
-    explicit operator bool() const { return !Bindings.empty(); }
-
-    /// Whether there are any non-defaultable bindings.
-    bool hasNonDefaultableBindings() const {
-      return Bindings.size() > NumDefaultableBindings;
-    }
-
-    static BindingScore formBindingScore(const PotentialBindings &b) {
-      return std::make_tuple(b.IsHole,
-                             !b.hasNonDefaultableBindings(),
-                             b.FullyBound,
-                             b.SubtypeOfExistentialType,
-                             b.InvolvesTypeVariables,
-                             static_cast<unsigned char>(b.LiteralBinding),
-                             -(b.Bindings.size() - b.NumDefaultableBindings));
-    }
-
-    /// Compare two sets of bindings, where \c x < y indicates that
-    /// \c x is a better set of bindings that \c y.
-    friend bool operator<(const PotentialBindings &x,
-                          const PotentialBindings &y) {
-      if (formBindingScore(x) < formBindingScore(y))
-        return true;
-
-      if (formBindingScore(y) < formBindingScore(x))
-        return false;
-
-      // If there is a difference in number of default types,
-      // prioritize bindings with fewer of them.
-      if (x.NumDefaultableBindings != y.NumDefaultableBindings)
-        return x.NumDefaultableBindings < y.NumDefaultableBindings;
-
-      // If neither type variable is a "hole" let's check whether
-      // there is a subtype relationship between them and prefer
-      // type variable which represents superclass first in order
-      // for "subtype" type variable to attempt more bindings later.
-      // This is required because algorithm can't currently infer
-      // bindings for subtype transitively through superclass ones.
-      if (!(x.IsHole && y.IsHole)) {
-        if (x.isSubtypeOf(y.TypeVar))
-          return false;
-
-        if (y.isSubtypeOf(x.TypeVar))
-          return true;
-      }
-
-      // As a last resort, let's check if the bindings are
-      // potentially incomplete, and if so, let's de-prioritize them.
-      return x.PotentiallyIncomplete < y.PotentiallyIncomplete;
-    }
-
-    void foundLiteralBinding(ProtocolDecl *proto) {
-      switch (*proto->getKnownProtocolKind()) {
-      case KnownProtocolKind::ExpressibleByDictionaryLiteral:
-      case KnownProtocolKind::ExpressibleByArrayLiteral:
-      case KnownProtocolKind::ExpressibleByStringInterpolation:
-        LiteralBinding = LiteralBindingKind::Collection;
-        break;
-
-      case KnownProtocolKind::ExpressibleByFloatLiteral:
-        LiteralBinding = LiteralBindingKind::Float;
-        break;
-
-      default:
-        if (LiteralBinding != LiteralBindingKind::Collection)
-          LiteralBinding = LiteralBindingKind::Atom;
-        break;
-      }
-    }
-
-    /// Add a potential binding to the list of bindings,
-    /// coalescing supertype bounds when we are able to compute the meet.
-    void addPotentialBinding(PotentialBinding binding,
-                             bool allowJoinMeet = true);
-
-    /// Check if this binding is viable for inclusion in the set.
-    bool isViable(PotentialBinding &binding) const;
-
-    bool isGenericParameter() const {
-      if (auto *locator = TypeVar->getImpl().getLocator()) {
-        auto path = locator->getPath();
-        return path.empty() ? false
-                            : path.back().getKind() ==
-                                  ConstraintLocator::GenericParameter;
-      }
-      return false;
-    }
-
-    bool isSubtypeOf(TypeVariableType *typeVar) const {
-      auto result = SubtypeOf.find(typeVar);
-      if (result == SubtypeOf.end())
-        return false;
-
-      auto *constraint = result->second;
-      return constraint->getKind() == ConstraintKind::Subtype;
-    }
-
-    /// Check if this binding is favored over a disjunction e.g.
-    /// if it has only concrete types or would resolve a closure.
-    bool favoredOverDisjunction(Constraint *disjunction) const;
-
-private:
-    /// Detect `subtype` relationship between two type variables and
-    /// attempt to infer supertype bindings transitively e.g.
-    ///
-    /// Given A <: T1 <: T2 transitively A <: T2
-    ///
-    /// Which gives us a new (superclass A) binding for T2 as well as T1.
-    ///
-    /// \param cs The constraint system this type variable is associated with.
-    ///
-    /// \param inferredBindings The set of all bindings inferred for type
-    /// variables in the workset.
-    void inferTransitiveBindings(
-        ConstraintSystem &cs,
-        llvm::SmallPtrSetImpl<CanType> &existingTypes,
-        const llvm::SmallDenseMap<TypeVariableType *,
-                                  ConstraintSystem::PotentialBindings>
-            &inferredBindings);
-
-    /// Detect subtype, conversion or equivalence relationship
-    /// between two type variables and attempt to propagate protocol
-    /// requirements down the subtype or equivalence chain.
-    void inferTransitiveProtocolRequirements(
-        const ConstraintSystem &cs,
-        llvm::SmallDenseMap<TypeVariableType *,
-                            ConstraintSystem::PotentialBindings>
-            &inferredBindings);
-
-    /// Infer bindings based on any protocol conformances that have default
-    /// types.
-    void inferDefaultTypes(ConstraintSystem &cs,
-                           llvm::SmallPtrSetImpl<CanType> &existingTypes);
-
-public:
-    bool infer(ConstraintSystem &cs,
-               llvm::SmallPtrSetImpl<CanType> &exactTypes,
-               Constraint *constraint);
-
-    /// Finalize binding computation for this type variable by
-    /// inferring bindings from context e.g. transitive bindings.
-    void finalize(ConstraintSystem &cs,
-                  llvm::SmallDenseMap<TypeVariableType *,
-                                      ConstraintSystem::PotentialBindings>
-                      &inferredBindings);
-
-    void dump(llvm::raw_ostream &out,
-              unsigned indent = 0) const LLVM_ATTRIBUTE_USED {
-      out.indent(indent);
-      if (PotentiallyIncomplete)
-        out << "potentially_incomplete ";
-      if (FullyBound)
-        out << "fully_bound ";
-      if (SubtypeOfExistentialType)
-        out << "subtype_of_existential ";
-      if (LiteralBinding != LiteralBindingKind::None)
-        out << "literal=" << static_cast<int>(LiteralBinding) << " ";
-      if (InvolvesTypeVariables)
-        out << "involves_type_vars ";
-      if (NumDefaultableBindings > 0)
-        out << "#defaultable_bindings=" << NumDefaultableBindings << " ";
-
-      PrintOptions PO;
-      PO.PrintTypesForDebugging = true;
-      out << "bindings={";
-      interleave(Bindings,
-                 [&](const PotentialBinding &binding) {
-                   auto type = binding.BindingType;
-                   switch (binding.Kind) {
-                   case AllowedBindingKind::Exact:
-                     break;
-
-                   case AllowedBindingKind::Subtypes:
-                     out << "(subtypes of) ";
-                     break;
-
-                   case AllowedBindingKind::Supertypes:
-                     out << "(supertypes of) ";
-                     break;
-                   }
-                   if (auto *literal = binding.getDefaultedLiteralProtocol())
-                     out << "(default from " << literal->getName() << ") ";
-                   out << type.getString(PO);
-                 },
-                 [&]() { out << "; "; });
-      out << "}";
-    }
-
-    void dump(ConstraintSystem *cs,
-              unsigned indent = 0) const LLVM_ATTRIBUTE_USED {
-      dump(llvm::errs());
-    }
-
-    void dump(TypeVariableType *typeVar, llvm::raw_ostream &out,
-              unsigned indent = 0) const LLVM_ATTRIBUTE_USED {
-      out.indent(indent);
-      out << "(";
-      if (typeVar)
-        out << "$T" << typeVar->getImpl().getID();
-      dump(out, 1);
-      out << ")\n";
-    }
-  };
-
-  Optional<Type> checkTypeOfBinding(TypeVariableType *typeVar, Type type) const;
   Optional<PotentialBindings> determineBestBindings();
 
-public:
   /// Infer bindings for the given type variable based on current
   /// state of the constraint system.
   PotentialBindings inferBindingsFor(TypeVariableType *typeVar,
                                      bool finalize = true);
 
 private:
-  Optional<ConstraintSystem::PotentialBinding>
-  getPotentialBindingForRelationalConstraint(PotentialBindings &result,
-                                             Constraint *constraint) const;
-
   /// Add a constraint to the constraint system.
   SolutionKind addConstraintImpl(ConstraintKind kind, Type first, Type second,
                                  ConstraintLocatorBuilder locator,
@@ -5327,6 +4972,27 @@ public:
   void partitionDisjunction(ArrayRef<Constraint *> Choices,
                             SmallVectorImpl<unsigned> &Ordering,
                             SmallVectorImpl<unsigned> &PartitionBeginning);
+
+  /// Partition the choices in the range \c first to \c last into groups and
+  /// order the groups in the best order to attempt based on the argument
+  /// function type that the operator is applied to.
+  void partitionGenericOperators(ArrayRef<Constraint *> Choices,
+                                 SmallVectorImpl<unsigned>::iterator first,
+                                 SmallVectorImpl<unsigned>::iterator last,
+                                 ConstraintLocator *locator);
+
+  // If the given constraint is an applied disjunction, get the argument function
+  // that the disjunction is applied to.
+  const FunctionType *getAppliedDisjunctionArgumentFunction(const Constraint *disjunction) {
+    assert(disjunction->getKind() == ConstraintKind::Disjunction);
+    return AppliedDisjunctions[disjunction->getLocator()];
+  }
+
+  /// The overload sets that have already been resolved along the current path.
+  const llvm::MapVector<ConstraintLocator *, SelectedOverload> &
+  getResolvedOverloads() const {
+    return ResolvedOverloads;
+  }
 
   /// If we aren't certain that we've emitted a diagnostic, emit a fallback
   /// diagnostic.
@@ -5684,11 +5350,10 @@ private:
 
 class TypeVariableBinding {
   TypeVariableType *TypeVar;
-  ConstraintSystem::PotentialBinding Binding;
+  PotentialBinding Binding;
 
 public:
-  TypeVariableBinding(TypeVariableType *typeVar,
-                      ConstraintSystem::PotentialBinding &binding)
+  TypeVariableBinding(TypeVariableType *typeVar, PotentialBinding &binding)
       : TypeVar(typeVar), Binding(binding) {}
 
   bool isDefaultable() const { return Binding.isDefaultableBinding(); }
@@ -5737,11 +5402,14 @@ public:
 };
 
 class TypeVarBindingProducer : public BindingProducer<TypeVariableBinding> {
-  using BindingKind = ConstraintSystem::AllowedBindingKind;
-  using Binding = ConstraintSystem::PotentialBinding;
+  using BindingKind = AllowedBindingKind;
+  using Binding = PotentialBinding;
 
   TypeVariableType *TypeVar;
   llvm::SmallVector<Binding, 8> Bindings;
+  /// The set of defaults to attempt once producer
+  /// runs out of direct & transitive bindings.
+  llvm::SmallVector<Constraint *, 4> DelayedDefaults;
 
   // The index pointing to the offset in the bindings
   // generator is currently at, `numTries` represents
@@ -5751,14 +5419,19 @@ class TypeVarBindingProducer : public BindingProducer<TypeVariableBinding> {
   llvm::SmallPtrSet<CanType, 4> ExploredTypes;
   llvm::SmallPtrSet<TypeBase *, 4> BoundTypes;
 
+  /// Determines whether this type variable has a
+  /// `ExpressibleByNilLiteral` requirement which
+  /// means that bindings have to either conform
+  /// to that protocol or be wrapped in an optional.
+  bool CanBeNil;
+
 public:
   using Element = TypeVariableBinding;
 
-  TypeVarBindingProducer(ConstraintSystem &cs,
-                         ConstraintSystem::PotentialBindings &bindings)
-      : BindingProducer(cs, bindings.TypeVar->getImpl().getLocator()),
-        TypeVar(bindings.TypeVar),
-        Bindings(bindings.Bindings.begin(), bindings.Bindings.end()) {}
+  TypeVarBindingProducer(PotentialBindings &bindings);
+
+  /// Retrieve a set of bindings available in the current state.
+  ArrayRef<Binding> getCurrentBindings() const { return Bindings; }
 
   Optional<Element> operator()() override {
     // Once we reach the end of the current bindings
@@ -5780,6 +5453,12 @@ private:
   /// \returns true if some new bindings were sucessfully computed,
   /// false otherwise.
   bool computeNext();
+
+  /// Check whether binding type is required to either conform to
+  /// `ExpressibleByNilLiteral` protocol or be wrapped into an optional type.
+  bool requiresOptionalAdjustment(const Binding &binding) const;
+
+  Binding getDefaultBinding(Constraint *constraint) const;
 };
 
 /// Iterator over disjunction choices, makes it
@@ -5809,7 +5488,11 @@ class DisjunctionChoiceProducer : public BindingProducer<DisjunctionChoice> {
 
   bool IsExplicitConversion;
 
+  Constraint *Disjunction;
+
   unsigned Index = 0;
+
+  bool needsGenericOperatorOrdering = true;
 
 public:
   using Element = DisjunctionChoice;
@@ -5819,7 +5502,8 @@ public:
                                 ? disjunction->getLocator()
                                 : nullptr),
         Choices(disjunction->getNestedConstraints()),
-        IsExplicitConversion(disjunction->isExplicitConversion()) {
+        IsExplicitConversion(disjunction->isExplicitConversion()),
+        Disjunction(disjunction) {
     assert(disjunction->getKind() == ConstraintKind::Disjunction);
     assert(!disjunction->shouldRememberChoice() || disjunction->getLocator());
 
@@ -5827,14 +5511,8 @@ public:
     CS.partitionDisjunction(Choices, Ordering, PartitionBeginning);
   }
 
-  DisjunctionChoiceProducer(ConstraintSystem &cs,
-                            ArrayRef<Constraint *> choices,
-                            ConstraintLocator *locator, bool explicitConversion)
-      : BindingProducer(cs, locator), Choices(choices),
-        IsExplicitConversion(explicitConversion) {
-
-    // Order and partition the disjunction choices.
-    CS.partitionDisjunction(Choices, Ordering, PartitionBeginning);
+  void setNeedsGenericOperatorOrdering(bool flag) {
+    needsGenericOperatorOrdering = flag;
   }
 
   Optional<Element> operator()() override {
@@ -5848,6 +5526,20 @@ public:
       ++PartitionIndex;
 
     ++Index;
+
+    auto choice = DisjunctionChoice(CS, currIndex, Choices[Ordering[currIndex]],
+                                    IsExplicitConversion, isBeginningOfPartition);
+    // Partition the generic operators before producing the first generic
+    // operator disjunction choice.
+    if (needsGenericOperatorOrdering && choice.isGenericOperator()) {
+      unsigned nextPartitionIndex = (PartitionIndex < PartitionBeginning.size() ?
+                                     PartitionBeginning[PartitionIndex] : Ordering.size());
+      CS.partitionGenericOperators(Choices,
+                                   Ordering.begin() + currIndex,
+                                   Ordering.begin() + nextPartitionIndex,
+                                   Disjunction->getLocator());
+      needsGenericOperatorOrdering = false;
+    }
 
     return DisjunctionChoice(CS, currIndex, Choices[Ordering[currIndex]],
                              IsExplicitConversion, isBeginningOfPartition);
@@ -6051,7 +5743,6 @@ struct DenseMapInfo<swift::constraints::SolutionApplicationTargetsKey> {
     return a == b;
   }
 };
-
-}
+} // end namespace llvm
 
 #endif // LLVM_SWIFT_SEMA_CONSTRAINT_SYSTEM_H

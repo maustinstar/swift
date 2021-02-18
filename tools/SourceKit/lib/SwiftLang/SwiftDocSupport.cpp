@@ -426,6 +426,9 @@ static bool initDocEntityInfo(const Decl *D,
   Info.IsUnavailable = AvailableAttr::isUnavailable(D);
   Info.IsDeprecated = D->getAttrs().getDeprecated(D->getASTContext()) != nullptr;
   Info.IsOptional = D->getAttrs().hasAttribute<OptionalAttr>();
+  if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
+    Info.IsAsync = AFD->hasAsync();
+  }
 
   if (!IsRef) {
     llvm::raw_svector_ostream OS(Info.DocComment);
@@ -465,11 +468,9 @@ static bool initDocEntityInfo(const Decl *D,
       SmallVector<Identifier, 1> Bystanders;
       if (MD->getRequiredBystandersIfCrossImportOverlay(
           DeclaringModForCrossImport, Bystanders)) {
-        std::transform(Bystanders.begin(), Bystanders.end(),
-                       std::back_inserter(Info.RequiredBystanders),
-                       [](Identifier Bystander){
-          return Bystander.str().str();
-        });
+        llvm::transform(
+            Bystanders, std::back_inserter(Info.RequiredBystanders),
+            [](Identifier Bystander) { return Bystander.str().str(); });
       } else {
         llvm_unreachable("DeclaringModForCrossImport not correct?");
       }
@@ -660,6 +661,7 @@ static void reportAttributes(ASTContext &Ctx,
   static UIdent PlatformtvOSAppExt("source.availability.platform.tvos_app_extension");
   static UIdent PlatformWatchOSAppExt("source.availability.platform.watchos_app_extension");
   static UIdent PlatformOpenBSD("source.availability.platform.openbsd");
+  static UIdent PlatformWindows("source.availability.platform.windows");
   std::vector<const DeclAttribute*> Scratch;
 
   for (auto Attr : getDeclAttributes(D, Scratch)) {
@@ -690,6 +692,8 @@ static void reportAttributes(ASTContext &Ctx,
         PlatformUID = PlatformWatchOSAppExt; break;
       case PlatformKind::OpenBSD:
         PlatformUID = PlatformOpenBSD; break;
+      case PlatformKind::Windows:
+        PlatformUID = PlatformWindows; break;
       }
 
       AvailableAttrInfo Info;
@@ -1226,8 +1230,8 @@ public:
   void accept(SourceManager &SM, RegionType RegionType,
               ArrayRef<Replacement> Replacements) {
     unsigned Start = AllEdits.size();
-    std::transform(
-        Replacements.begin(), Replacements.end(), std::back_inserter(AllEdits),
+    llvm::transform(
+        Replacements, std::back_inserter(AllEdits),
         [&](const Replacement &R) -> Edit {
           std::pair<unsigned, unsigned> Start =
                                             SM.getPresumedLineAndColumnForLoc(
@@ -1236,8 +1240,8 @@ public:
                                             R.Range.getEnd());
           SmallVector<NoteRegion, 4> SubRanges;
           auto RawRanges = R.RegionsWorthNote;
-          std::transform(
-              RawRanges.begin(), RawRanges.end(), std::back_inserter(SubRanges),
+          llvm::transform(
+              RawRanges, std::back_inserter(SubRanges),
               [](swift::ide::NoteRegion R) -> SourceKit::NoteRegion {
                 return {SwiftLangSupport::getUIDForRefactoringRangeKind(R.Kind),
                         R.StartLine,

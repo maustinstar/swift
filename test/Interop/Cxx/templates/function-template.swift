@@ -12,14 +12,20 @@ FunctionTemplateTestSuite.test("passThrough<T> where T == Int") {
   expectEqual(42, result)
 }
 
-FunctionTemplateTestSuite.test("add<T> where T == Int") {
-  let result = add(42, 23)
+FunctionTemplateTestSuite.test("addSameTypeParams<T> where T == Int") {
+  let result = addSameTypeParams(42, 23)
   expectEqual(65, result)
 }
 
-FunctionTemplateTestSuite.test("add<T, U> where T, U == Int") {
-  let result = addTwoTemplates(42, 23)
+FunctionTemplateTestSuite.test("addSameTypeParams<T, U> where T, U == Int") {
+  let result = addMixedTypeParams(42, 23)
   expectEqual(65, result)
+}
+
+FunctionTemplateTestSuite.test("lvalueReference<T> where T == Int") {
+  var value = 0
+  lvalueReference(&value)
+  expectEqual(value, 42)
 }
 
 // TODO: currently "Any" is imported as an Objective-C "id".

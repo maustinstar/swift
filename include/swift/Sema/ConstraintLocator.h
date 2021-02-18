@@ -39,6 +39,7 @@ class TypeLoc;
 class VarDecl;
 class Pattern;
 class SourceManager;
+class ProtocolConformance;
 
 namespace constraints {
 
@@ -740,7 +741,7 @@ public:
 
 class LocatorPathElt::ArgumentAttribute final : public StoredIntegerElement<1> {
 public:
-  enum Attribute : uint8_t { InOut, Escaping };
+  enum Attribute : uint8_t { InOut, Escaping, Concurrent };
 
 private:
   ArgumentAttribute(Attribute attr)
@@ -757,8 +758,26 @@ public:
     return ArgumentAttribute(Attribute::Escaping);
   }
 
+  static ArgumentAttribute forConcurrent() {
+    return ArgumentAttribute(Attribute::Concurrent);
+  }
+
   static bool classof(const LocatorPathElt *elt) {
     return elt->getKind() == ConstraintLocator::ArgumentAttribute;
+  }
+};
+
+class LocatorPathElt::ConformanceRequirement final
+    : public StoredPointerElement<ProtocolConformance> {
+public:
+  ConformanceRequirement(ProtocolConformance *conformance)
+      : StoredPointerElement(PathElementKind::ConformanceRequirement,
+                             conformance) {}
+
+  ProtocolConformance *getConformance() const { return getStoredPointer(); }
+
+  static bool classof(const LocatorPathElt *elt) {
+    return elt->getKind() == ConstraintLocator::ConformanceRequirement;
   }
 };
 

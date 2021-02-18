@@ -134,9 +134,11 @@ static void addAddressSanitizerPasses(const PassManagerBuilder &Builder,
   auto recover =
       bool(BuilderWrapper.IRGOpts.SanitizersWithRecoveryInstrumentation &
            SanitizerKind::Address);
+  auto useODRIndicator = BuilderWrapper.IRGOpts.SanitizeAddressUseODRIndicator;
   PM.add(createAddressSanitizerFunctionPass(/*CompileKernel=*/false, recover));
-  PM.add(createModuleAddressSanitizerLegacyPassPass(/*CompileKernel=*/false,
-                                                    recover));
+  PM.add(createModuleAddressSanitizerLegacyPassPass(
+      /*CompileKernel=*/false, recover, /*UseGlobalsGC=*/true,
+      useODRIndicator));
 }
 
 static void addThreadSanitizerPass(const PassManagerBuilder &Builder,
@@ -690,8 +692,24 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
       SpecialPointerAuthDiscriminators::ResilientClassStubInitCallback);
 
   opts.AsyncContextParent =
-      PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
                         SpecialPointerAuthDiscriminators::AsyncContextParent);
+
+  opts.AsyncContextResume =
+      PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
+                        SpecialPointerAuthDiscriminators::AsyncContextResume);
+
+  opts.TaskResumeFunction =
+      PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
+                        SpecialPointerAuthDiscriminators::TaskResumeFunction);
+
+  opts.TaskResumeContext =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
+                        SpecialPointerAuthDiscriminators::TaskResumeContext);
+
+  opts.AsyncContextExtendedFrameEntry = PointerAuthSchema(
+      dataKey, /*address*/ true, Discrimination::Constant,
+      SpecialPointerAuthDiscriminators::SwiftAsyncContextExtendedFrameEntry);
 }
 
 std::unique_ptr<llvm::TargetMachine>
@@ -1453,6 +1471,7 @@ swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
                                           Data, "__Swift_AST");
   std::string Section;
   switch (IGM.TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("unknown object format");
   case llvm::Triple::XCOFF:

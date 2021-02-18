@@ -120,6 +120,7 @@ getLoweredTypeAndTypeInfo(IRGenModule &IGM, Type unloweredType) {
 /// emitBuiltinCall - Emit a call to a builtin function.
 void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
                             Identifier FnId, SILType resultType,
+                            ArrayRef<SILType> argTypes,
                             Explosion &args, Explosion &out,
                             SubstitutionMap substitutions) {
   if (Builtin.ID == BuiltinValueKind::COWBufferForReading) {
@@ -223,6 +224,63 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
   if (Builtin.ID == BuiltinValueKind::CancelAsyncTask) {
     emitTaskCancel(IGF, args.claimNext());
     return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::CreateAsyncTask ||
+      Builtin.ID == BuiltinValueKind::CreateAsyncTaskFuture) {
+    auto flags = args.claimNext();
+    auto parentTask = args.claimNext();
+    auto futureResultType =
+        (Builtin.ID == BuiltinValueKind::CreateAsyncTaskFuture)
+          ? args.claimNext()
+          : nullptr;
+    auto taskFunction = args.claimNext();
+    auto taskContext = args.claimNext();
+
+    // FIXME: SIL treats the function/context parameter as "guaranteed", but
+    // the runtime entry point assumes it is owned. Introduce an extra retain
+    // of the context to balance things out.
+    IGF.emitNativeStrongRetain(taskContext, IGF.getDefaultAtomicity());
+
+    auto newTaskAndContext = emitTaskCreate(
+        IGF, flags, parentTask, futureResultType, taskFunction, taskContext,
+        substitutions);
+
+    // Cast back to NativeObject/RawPointer.
+    auto newTask = IGF.Builder.CreateExtractValue(newTaskAndContext, { 0 });
+    newTask = IGF.Builder.CreateBitCast(newTask, IGF.IGM.RefCountedPtrTy);
+    auto newContext = IGF.Builder.CreateExtractValue(newTaskAndContext, { 1 });
+    newContext = IGF.Builder.CreateBitCast(newContext, IGF.IGM.Int8PtrTy);
+    out.add(newTask);
+    out.add(newContext);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::ConvertTaskToJob) {
+    auto task = args.claimNext();
+    // The job object starts immediately past the heap-object header.
+    auto bytes = IGF.Builder.CreateBitCast(task, IGF.IGM.Int8PtrTy);
+    auto offset = IGF.IGM.RefCountedStructSize;
+    bytes = IGF.Builder.CreateInBoundsGEP(bytes, IGF.IGM.getSize(offset));
+    auto job = IGF.Builder.CreateBitCast(bytes, IGF.IGM.SwiftJobPtrTy);
+    out.add(job);
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::InitializeDefaultActor ||
+      Builtin.ID == BuiltinValueKind::DestroyDefaultActor) {
+    auto fn = Builtin.ID == BuiltinValueKind::InitializeDefaultActor
+                ? IGF.IGM.getDefaultActorInitializeFn()
+                : IGF.IGM.getDefaultActorDestroyFn();
+    auto actor = args.claimNext();
+    actor = IGF.Builder.CreateBitCast(actor, IGF.IGM.RefCountedPtrTy);
+    auto call = IGF.Builder.CreateCall(fn, {actor});
+    call->setCallingConv(IGF.IGM.SwiftCC);
+    call->setDoesNotThrow();
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::DestroyDefaultActor) {
   }
 
   // If this is an LLVM IR intrinsic, lower it to an intrinsic call.
@@ -1017,7 +1075,18 @@ if (Builtin.ID == BuiltinValueKind::id) { \
 
   if (Builtin.ID == BuiltinValueKind::TSanInoutAccess) {
     auto address = args.claimNext();
-    IGF.emitTSanInoutAccessCall(address);
+
+    // The tsanInoutAccess builtin takes a single argument, the address
+    // of the accessed storage
+    SILType accessedType = argTypes[0];
+
+    // Empty types (such as structs without stored properties) have a
+    // meaningless value for their address. We not should call into the
+    // TSan runtime to check for data races on accesses on such addresses.
+    if (!IGF.IGM.getTypeInfo(accessedType)
+        .isKnownEmpty(ResilienceExpansion::Maximal)) {
+      IGF.emitTSanInoutAccessCall(address);
+    }
     return;
   }
 
@@ -1081,6 +1150,28 @@ if (Builtin.ID == BuiltinValueKind::id) { \
         IGF.Builder.CreateBitCast(metatypeRHS, IGF.IGM.Int8PtrTy);
 
     out.add(IGF.Builder.CreateICmpEQ(metatypeLHSCasted, metatypeRHSCasted));
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::AutoDiffCreateLinearMapContext) {
+    auto topLevelSubcontextSize = args.claimNext();
+    out.add(emitAutoDiffCreateLinearMapContext(IGF, topLevelSubcontextSize)
+                .getAddress());
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::AutoDiffProjectTopLevelSubcontext) {
+    Address allocatorAddr(args.claimNext(), IGF.IGM.getPointerAlignment());
+    out.add(
+        emitAutoDiffProjectTopLevelSubcontext(IGF, allocatorAddr).getAddress());
+    return;
+  }
+
+  if (Builtin.ID == BuiltinValueKind::AutoDiffAllocateSubcontext) {
+    Address allocatorAddr(args.claimNext(), IGF.IGM.getPointerAlignment());
+    auto size = args.claimNext();
+    out.add(
+        emitAutoDiffAllocateSubcontext(IGF, allocatorAddr, size).getAddress());
     return;
   }
 

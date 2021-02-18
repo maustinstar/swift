@@ -131,13 +131,14 @@ TreatRValueAsLValue *TreatRValueAsLValue::create(ConstraintSystem &cs,
 
 bool CoerceToCheckedCast::diagnose(const Solution &solution,
                                    bool asNote) const {
-  MissingForcedDowncastFailure failure(solution, getFromType(), getToType(),
-                                       getLocator());
+  InvalidCoercionFailure failure(solution, getFromType(), getToType(),
+                                 UseConditionalCast, getLocator());
   return failure.diagnose(asNote);
 }
 
 CoerceToCheckedCast *CoerceToCheckedCast::attempt(ConstraintSystem &cs,
                                                   Type fromType, Type toType,
+                                                  bool useConditionalCast,
                                                   ConstraintLocator *locator) {
   // If any of the types has a type variable, don't add the fix.
   if (fromType->hasTypeVariable() || toType->hasTypeVariable())
@@ -159,13 +160,31 @@ CoerceToCheckedCast *CoerceToCheckedCast::attempt(ConstraintSystem &cs,
     return nullptr;
 
   return new (cs.getAllocator())
-      CoerceToCheckedCast(cs, fromType, toType, locator);
+      CoerceToCheckedCast(cs, fromType, toType, useConditionalCast, locator);
 }
+
+bool TreatArrayLiteralAsDictionary::diagnose(const Solution &solution,
+                                             bool asNote) const {
+  ArrayLiteralToDictionaryConversionFailure failure(solution,
+                                                    getToType(), getFromType(),
+                                                    getLocator());
+  return failure.diagnose(asNote);
+};
+
+TreatArrayLiteralAsDictionary *
+TreatArrayLiteralAsDictionary::create(ConstraintSystem &cs,
+                                      Type dictionaryTy, Type arrayTy,
+                                      ConstraintLocator *locator) {
+  assert(getAsExpr<ArrayExpr>(locator->getAnchor())->getNumElements() <= 1);
+  return new (cs.getAllocator())
+      TreatArrayLiteralAsDictionary(cs, dictionaryTy, arrayTy, locator);
+};
 
 bool MarkExplicitlyEscaping::diagnose(const Solution &solution,
                                       bool asNote) const {
-  NoEscapeFuncToTypeConversionFailure failure(solution, getFromType(),
-                                              getToType(), getLocator());
+  AttributedFuncToTypeConversionFailure failure(
+      solution, getFromType(), getToType(), getLocator(),
+      AttributedFuncToTypeConversionFailure::Escaping);
   return failure.diagnose(asNote);
 }
 
@@ -179,6 +198,26 @@ MarkExplicitlyEscaping::create(ConstraintSystem &cs, Type lhs, Type rhs,
   return new (cs.getAllocator()) MarkExplicitlyEscaping(cs, lhs, rhs, locator);
 }
 
+bool AddConcurrentAttribute::diagnose(const Solution &solution,
+                                      bool asNote) const {
+  AttributedFuncToTypeConversionFailure failure(
+      solution, getFromType(), getToType(), getLocator(),
+      AttributedFuncToTypeConversionFailure::Concurrent);
+  return failure.diagnose(asNote);
+}
+
+AddConcurrentAttribute *
+AddConcurrentAttribute::create(ConstraintSystem &cs,
+                               FunctionType *fromType,
+                               FunctionType *toType,
+                               ConstraintLocator *locator) {
+  if (locator->isLastElement<LocatorPathElt::ApplyArgToParam>())
+    locator = cs.getConstraintLocator(
+        locator, LocatorPathElt::ArgumentAttribute::forConcurrent());
+
+  return new (cs.getAllocator()) AddConcurrentAttribute(
+      cs, fromType, toType, locator);
+}
 bool RelabelArguments::diagnose(const Solution &solution, bool asNote) const {
   LabelingFailure failure(solution, getLocator(), getLabels());
   return failure.diagnose(asNote);
@@ -1122,6 +1161,21 @@ DropThrowsAttribute *DropThrowsAttribute::create(ConstraintSystem &cs,
       DropThrowsAttribute(cs, fromType, toType, locator);
 }
 
+bool DropAsyncAttribute::diagnose(const Solution &solution,
+                                   bool asNote) const {
+  AsyncFunctionConversionFailure failure(solution, getFromType(),
+                                         getToType(), getLocator());
+  return failure.diagnose(asNote);
+}
+
+DropAsyncAttribute *DropAsyncAttribute::create(ConstraintSystem &cs,
+                                               FunctionType *fromType,
+                                               FunctionType *toType,
+                                               ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      DropAsyncAttribute(cs, fromType, toType, locator);
+}
+
 bool IgnoreContextualType::diagnose(const Solution &solution,
                                     bool asNote) const {
   ContextualFailure failure(solution, getFromType(), getToType(), getLocator());
@@ -1562,7 +1616,7 @@ bool IgnoreInvalidResultBuilderBody::diagnose(const Solution &solution,
     return true; // Already diagnosed by `matchResultBuilder`.
   }
 
-  auto *S = getAnchor().get<Stmt *>();
+  auto *S = castToExpr<ClosureExpr>(getAnchor())->getBody();
 
   class PreCheckWalker : public ASTWalker {
     DeclContext *DC;
@@ -1626,4 +1680,187 @@ AllowRefToInvalidDecl *
 AllowRefToInvalidDecl::create(ConstraintSystem &cs,
                               ConstraintLocator *locator) {
   return new (cs.getAllocator()) AllowRefToInvalidDecl(cs, locator);
+}
+
+bool IgnoreResultBuilderWithReturnStmts::diagnose(const Solution &solution,
+                                                  bool asNote) const {
+  InvalidReturnInResultBuilderBody failure(solution, BuilderType, getLocator());
+  return failure.diagnose(asNote);
+}
+
+IgnoreResultBuilderWithReturnStmts *
+IgnoreResultBuilderWithReturnStmts::create(ConstraintSystem &cs, Type builderTy,
+                                           ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      IgnoreResultBuilderWithReturnStmts(cs, builderTy, locator);
+}
+
+bool SpecifyBaseTypeForOptionalUnresolvedMember::diagnose(
+    const Solution &solution, bool asNote) const {
+  MemberMissingExplicitBaseTypeFailure failure(solution, MemberName,
+                                               getLocator());
+  return failure.diagnose(asNote);
+}
+
+SpecifyBaseTypeForOptionalUnresolvedMember *
+SpecifyBaseTypeForOptionalUnresolvedMember::attempt(
+    ConstraintSystem &cs, ConstraintKind kind, Type baseTy,
+    DeclNameRef memberName, FunctionRefKind functionRefKind,
+    MemberLookupResult result, ConstraintLocator *locator) {
+
+  if (kind != ConstraintKind::UnresolvedValueMember)
+    return nullptr;
+
+  // None or only one viable candidate, there is no ambiguity.
+  if (result.ViableCandidates.size() <= 1)
+    return nullptr;
+
+  // Only diagnose those situations for static members.
+  if (!baseTy->is<MetatypeType>())
+    return nullptr;
+
+  // Don't diagnose for function members e.g. Foo? = .none(0).
+  if (functionRefKind != FunctionRefKind::Unapplied)
+    return nullptr;
+
+  Type underlyingBaseType = baseTy->getMetatypeInstanceType();
+  if (!underlyingBaseType->getNominalOrBoundGenericNominal())
+    return nullptr;
+
+  if (!underlyingBaseType->getOptionalObjectType())
+    return nullptr;
+
+  auto unwrappedType = underlyingBaseType->lookThroughAllOptionalTypes();
+  bool allOptionalBaseCandidates = true;
+  auto filterViableCandidates =
+      [&](SmallVector<OverloadChoice, 4> &candidates,
+          SmallVector<OverloadChoice, 4> &viableCandidates,
+          bool &allOptionalBase) {
+        for (OverloadChoice choice : candidates) {
+          if (!choice.isDecl())
+            continue;
+
+          auto memberDecl = choice.getDecl();
+          if (isa<FuncDecl>(memberDecl))
+            continue;
+          if (memberDecl->isInstanceMember())
+            continue;
+
+          allOptionalBase &= bool(choice.getBaseType()
+                                      ->getMetatypeInstanceType()
+                                      ->getOptionalObjectType());
+
+          if (auto EED = dyn_cast<EnumElementDecl>(memberDecl)) {
+            if (!EED->hasAssociatedValues())
+              viableCandidates.push_back(choice);
+          } else if (auto VD = dyn_cast<VarDecl>(memberDecl)) {
+            if (unwrappedType->hasTypeVariable() ||
+                VD->getInterfaceType()->isEqual(unwrappedType))
+              viableCandidates.push_back(choice);
+          }
+        }
+      };
+
+  SmallVector<OverloadChoice, 4> viableCandidates;
+  filterViableCandidates(result.ViableCandidates, viableCandidates,
+                         allOptionalBaseCandidates);
+
+  // Also none or only one viable candidate after filtering candidates, there is
+  // no ambiguity.
+  if (viableCandidates.size() <= 1)
+    return nullptr;
+
+  // Right now, name lookup only unwraps a single layer of optionality, which
+  // for cases where base type is a multi-optional type e.g. Foo?? it only
+  // finds optional base candidates. To produce the correct warning we perform
+  // an extra lookup on unwrapped type.
+  if (!allOptionalBaseCandidates)
+    return new (cs.getAllocator())
+        SpecifyBaseTypeForOptionalUnresolvedMember(cs, memberName, locator);
+
+  MemberLookupResult unwrappedResult =
+      cs.performMemberLookup(kind, memberName, MetatypeType::get(unwrappedType),
+                             functionRefKind, locator,
+                             /*includeInaccessibleMembers*/ false);
+  SmallVector<OverloadChoice, 4> unwrappedViableCandidates;
+  filterViableCandidates(unwrappedResult.ViableCandidates,
+                         unwrappedViableCandidates, allOptionalBaseCandidates);
+  if (unwrappedViableCandidates.empty())
+    return nullptr;
+
+  return new (cs.getAllocator())
+      SpecifyBaseTypeForOptionalUnresolvedMember(cs, memberName, locator);
+}
+
+AllowCheckedCastCoercibleOptionalType *
+AllowCheckedCastCoercibleOptionalType::create(ConstraintSystem &cs,
+                                              Type fromType, Type toType,
+                                              CheckedCastKind kind,
+                                              ConstraintLocator *locator) {
+  return new (cs.getAllocator()) AllowCheckedCastCoercibleOptionalType(
+      cs, fromType, toType, kind, locator);
+}
+
+bool AllowCheckedCastCoercibleOptionalType::diagnose(const Solution &solution,
+                                                     bool asNote) const {
+  CoercibleOptionalCheckedCastFailure failure(
+      solution, getFromType(), getToType(), CastKind, getLocator());
+  return failure.diagnose(asNote);
+}
+
+AllowAlwaysSucceedCheckedCast *
+AllowAlwaysSucceedCheckedCast::create(ConstraintSystem &cs, Type fromType,
+                                      Type toType, CheckedCastKind kind,
+                                      ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      AllowAlwaysSucceedCheckedCast(cs, fromType, toType, kind, locator);
+}
+
+bool AllowAlwaysSucceedCheckedCast::diagnose(const Solution &solution,
+                                             bool asNote) const {
+  AlwaysSucceedCheckedCastFailure failure(solution, getFromType(), getToType(),
+                                          CastKind, getLocator());
+  return failure.diagnose(asNote);
+}
+
+// Although function types maybe compile-time convertible because
+// compiler can emit thunks at SIL to handle the conversion when
+// required, only convertions that are supported by the runtime are
+// when types are trivially equal or non-throwing from type is equal
+// to throwing to type without throwing clause conversions are not
+// possible at runtime.
+bool AllowUnsupportedRuntimeCheckedCast::runtimeSupportedFunctionTypeCast(
+    FunctionType *fnFromType, FunctionType *fnToType) {
+  if (fnFromType->isEqual(fnToType)) {
+    return true;
+  } else if (!fnFromType->isThrowing() && fnToType->isThrowing()) {
+    return fnFromType->isEqual(
+        fnToType->getWithoutThrowing()->castTo<FunctionType>());
+  }
+  // Runtime cannot perform such conversion.
+  return false;
+}
+
+AllowUnsupportedRuntimeCheckedCast *
+AllowUnsupportedRuntimeCheckedCast::attempt(ConstraintSystem &cs, Type fromType,
+                                            Type toType, CheckedCastKind kind,
+                                            ConstraintLocator *locator) {
+  auto fnFromType = fromType->getAs<FunctionType>();
+  auto fnToType = toType->getAs<FunctionType>();
+
+  if (!(fnFromType && fnToType))
+    return nullptr;
+
+  if (runtimeSupportedFunctionTypeCast(fnFromType, fnToType))
+    return nullptr;
+
+  return new (cs.getAllocator())
+      AllowUnsupportedRuntimeCheckedCast(cs, fromType, toType, kind, locator);
+}
+
+bool AllowUnsupportedRuntimeCheckedCast::diagnose(const Solution &solution,
+                                                 bool asNote) const {
+  UnsupportedRuntimeCheckedCastFailure failure(
+      solution, getFromType(), getToType(), CastKind, getLocator());
+  return failure.diagnose(asNote);
 }

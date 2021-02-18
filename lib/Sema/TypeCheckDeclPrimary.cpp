@@ -26,6 +26,7 @@
 #include "TypeCheckObjC.h"
 #include "TypeCheckType.h"
 #include "MiscDiagnostics.h"
+#include "swift/AST/AccessNotes.h"
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTVisitor.h"
@@ -179,6 +180,20 @@ static void checkInheritanceClause(
     // GenericSignatureBuilder (for protocol inheritance) or the
     // ConformanceLookupTable (for protocol conformance).
     if (inheritedTy->isAnyObject()) {
+      // Warn inherited AnyObject written as 'class' as deprecated
+      // for Swift >= 5.
+      auto sourceRange = inherited.getSourceRange();
+      bool isWrittenAsClass =
+          (isa<ProtocolDecl>(decl) || isa<AbstractTypeParamDecl>(decl)) &&
+          Lexer::getTokenAtLocation(ctx.SourceMgr, sourceRange.Start)
+              .is(tok::kw_class);
+      if (ctx.LangOpts.isSwiftVersionAtLeast(5) && isWrittenAsClass) {
+        diags
+            .diagnose(sourceRange.Start,
+                      diag::anyobject_class_inheritance_deprecated)
+            .fixItReplace(sourceRange, "AnyObject");
+      }
+
       if (inheritedAnyObject) {
         // If the first occurrence was written as 'class', downgrade the error
         // to a warning in such case for backward compatibility with
@@ -401,9 +416,6 @@ template<typename T>
 static void diagnoseDuplicateDecls(const T &decls) {
   llvm::SmallDenseMap<DeclBaseName, const ValueDecl *> names;
   for (auto *current : decls) {
-    if (!current->getASTContext().LangOpts.DisableParserLookup)
-      return;
-
     if (!current->hasName() || current->isImplicit())
       continue;
 
@@ -528,13 +540,11 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
       otherDefinitions.append(found.begin(), found.end());
     }
   } else if (currentDC->isLocalContext()) {
-    if (ctx.LangOpts.DisableParserLookup) {
-      if (!current->isImplicit()) {
-        ASTScope::lookupLocalDecls(currentFile, current->getBaseName(),
-                                   current->getLoc(),
-                                   /*stopAfterInnermostBraceStmt=*/true,
-                                   otherDefinitions);
-      }
+    if (!current->isImplicit()) {
+      ASTScope::lookupLocalDecls(currentFile, current->getBaseName(),
+                                 current->getLoc(),
+                                 /*stopAfterInnermostBraceStmt=*/true,
+                                 otherDefinitions);
     }
   } else {
     assert(currentDC->isModuleScopeContext());
@@ -556,12 +566,14 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
     if (current == other || (other->hasInterfaceType() && other->isInvalid()))
       continue;
 
+    auto *otherDC = other->getDeclContext();
+
     // Skip declarations in other modules.
-    if (currentModule != other->getModuleContext())
+    if (currentModule != otherDC->getParentModule())
       continue;
 
     // If both declarations are in the same file, only diagnose the second one.
-    if (currentFile == other->getDeclContext()->getParentSourceFile())
+    if (currentFile == otherDC->getParentSourceFile())
       if (current->getLoc().isValid() &&
           ctx.SourceMgr.isBeforeInBuffer(
             current->getLoc(), other->getLoc()))
@@ -569,7 +581,7 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
 
     // Don't compare methods vs. non-methods (which only happens with
     // operators).
-    if (currentDC->isTypeContext() != other->getDeclContext()->isTypeContext())
+    if (currentDC->isTypeContext() != otherDC->isTypeContext())
       continue;
 
     // In local context, only consider exact name matches.
@@ -583,7 +595,7 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
     if (!conflicting(currentSig, otherSig))
       continue;
 
-    // Skip declarations in other files.
+    // Skip inaccessible declarations in other files.
     // In practice, this means we will warn on a private declaration that
     // shadows a non-private one, but only in the file where the shadowing
     // happens. We will warn on conflicting non-private declarations in both
@@ -594,6 +606,15 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
 
     // Skip invalid declarations.
     if (other->isInvalid())
+      continue;
+
+    // Allow redeclarations of typealiases in different constrained
+    // extensions.
+    if (isa<TypeAliasDecl>(current) &&
+        isa<TypeAliasDecl>(other) &&
+        currentDC != otherDC &&
+        currentDC->getGenericSignatureOfContext().getCanonicalSignature() !=
+        otherDC->getGenericSignatureOfContext().getCanonicalSignature())
       continue;
 
     // Thwart attempts to override the same declaration more than once.
@@ -624,6 +645,66 @@ CheckRedeclarationRequest::evaluate(Evaluator &eval, ValueDecl *current) const {
             other->getDeclContext()->getModuleScopeContext());
         if (otherFile && otherFile->isSIB())
           continue;
+      }
+
+      // Signatures are the same, but interface types are not. We must
+      // have a type that we've massaged as part of signature
+      // interface type generation.
+      if (current->getInterfaceType()->isEqual(other->getInterfaceType())) {
+        if (currentDC->isTypeContext() == other->getDeclContext()->isTypeContext()) {
+          auto currFnTy = current->getInterfaceType()->getAs<AnyFunctionType>();
+          auto otherFnTy = other->getInterfaceType()->getAs<AnyFunctionType>();
+          if (currFnTy && otherFnTy && currentDC->isTypeContext()) {
+            currFnTy = currFnTy->getResult()->getAs<AnyFunctionType>();
+            otherFnTy = otherFnTy->getResult()->getAs<AnyFunctionType>();
+          }
+          
+          if (currFnTy && otherFnTy) {
+            ArrayRef<AnyFunctionType::Param> currParams = currFnTy->getParams();
+            ArrayRef<AnyFunctionType::Param> otherParams = otherFnTy->getParams();
+            
+            if (currParams.size() == otherParams.size()) {
+              auto diagnosed = false;
+              for (unsigned i : indices(currParams)) {
+                  
+                bool currIsIUO = false;
+                bool otherIsIUO = false;
+                bool optionalRedecl = false;
+                
+                if (currParams[i].getPlainType()->getOptionalObjectType()) {
+                  optionalRedecl = true;
+                  if (swift::getParameterAt(current, i)->isImplicitlyUnwrappedOptional())
+                    currIsIUO = true;
+                }
+                
+                if (otherParams[i].getPlainType()->getOptionalObjectType()) {
+                  if (swift::getParameterAt(other, i)->isImplicitlyUnwrappedOptional())
+                    otherIsIUO = true;
+                }
+                else {
+                  optionalRedecl = false;
+                }
+                
+                if (optionalRedecl && currIsIUO != otherIsIUO) {
+                  ctx.Diags.diagnoseWithNotes(
+                    current->diagnose(diag::invalid_redecl,
+                                      current->getName()), [&]() {
+                    other->diagnose(diag::invalid_redecl_prev, other->getName());
+                  });
+                  current->diagnose(diag::invalid_redecl_by_optionality_note,
+                                    otherIsIUO, currIsIUO);
+                  
+                  current->setInvalid();
+                  diagnosed = true;
+                  break;
+                }
+              }
+
+              if (diagnosed)
+                break;
+            }
+          }
+        }
       }
 
       // If the conflicting declarations have non-overlapping availability and,
@@ -910,11 +991,13 @@ Expr *DefaultArgumentExprRequest::evaluate(Evaluator &evaluator,
     return new (ctx) ErrorExpr(initExpr->getSourceRange(), ErrorType::get(ctx));
   }
 
-  TypeChecker::checkInitializerEffects(dc, initExpr);
-
   // Walk the checked initializer and contextualize any closures
   // we saw there.
   TypeChecker::contextualizeInitializer(dc, initExpr);
+
+  checkInitializerActorIsolation(dc, initExpr);
+  TypeChecker::checkInitializerEffects(dc, initExpr);
+
   return initExpr;
 }
 
@@ -1363,6 +1446,110 @@ void TypeChecker::diagnoseDuplicateCaptureVars(CaptureListExpr *expr) {
   diagnoseDuplicateDecls(captureListVars);
 }
 
+template<typename ...DiagIDAndArgs> InFlightDiagnostic
+diagnoseAtAttrOrDecl(DeclAttribute *attr, ValueDecl *VD,
+                     DiagIDAndArgs... idAndArgs) {
+  ASTContext &ctx = VD->getASTContext();
+  if (attr->getLocation().isValid())
+    return ctx.Diags.diagnose(attr->getLocation(), idAndArgs...);
+  else
+    return ctx.Diags.diagnose(VD, idAndArgs...);
+}
+
+template <typename Attr>
+static void addOrRemoveAttr(ValueDecl *VD, const AccessNotesFile &notes,
+                            Optional<bool> expected,
+                            llvm::function_ref<Attr*()> willCreate) {
+  if (!expected) return;
+
+  auto attr = VD->getAttrs().getAttribute<Attr>();
+  if (*expected == (attr != nullptr)) return;
+
+  auto diagnoseChangeByAccessNote =
+      [&](Diag<StringRef, bool, StringRef, DescriptiveDeclKind> diagID,
+          Diag<bool> fixitID) -> InFlightDiagnostic {
+    bool isModifier = attr->isDeclModifier();
+
+    diagnoseAtAttrOrDecl(attr, VD, diagID, notes.Reason, isModifier,
+                          attr->getAttrName(), VD->getDescriptiveKind());
+    return diagnoseAtAttrOrDecl(attr, VD, fixitID, isModifier);
+  };
+
+  if (*expected) {
+    attr = willCreate();
+    VD->getAttrs().add(attr);
+
+    SmallString<64> attrString;
+    llvm::raw_svector_ostream os(attrString);
+    attr->print(os, VD);
+
+    diagnoseChangeByAccessNote(diag::attr_added_by_access_note,
+                               diag::fixit_attr_added_by_access_note)
+      .fixItInsert(VD->getAttributeInsertionLoc(attr->isDeclModifier()),
+                   attrString);
+  } else {
+    VD->getAttrs().removeAttribute(attr);
+    diagnoseChangeByAccessNote(diag::attr_removed_by_access_note,
+                               diag::fixit_attr_removed_by_access_note)
+      .fixItRemove(attr->getRangeWithAt());
+  }
+}
+
+static void applyAccessNote(ValueDecl *VD, const AccessNote &note,
+                            const AccessNotesFile &notes) {
+  ASTContext &ctx = VD->getASTContext();
+
+  addOrRemoveAttr<ObjCAttr>(VD, notes, note.ObjC, [&]{
+    return ObjCAttr::create(ctx, note.ObjCName, false);
+  });
+
+  addOrRemoveAttr<DynamicAttr>(VD, notes, note.Dynamic, [&]{
+    return new (ctx) DynamicAttr(true);
+  });
+
+  if (note.ObjCName) {
+    auto attr = VD->getAttrs().getAttribute<ObjCAttr>();
+    assert(attr && "ObjCName set, but ObjCAttr not true or did not apply???");
+
+    if (!attr->hasName()) {
+      attr->setName(*note.ObjCName, true);
+      diagnoseAtAttrOrDecl(attr, VD,
+                           diag::attr_objc_name_changed_by_access_note,
+                           notes.Reason, VD->getDescriptiveKind(),
+                           *note.ObjCName);
+
+      SmallString<64> newNameString;
+      llvm::raw_svector_ostream os(newNameString);
+      os << "(";
+      os << *note.ObjCName;
+      os << ")";
+
+      auto note = diagnoseAtAttrOrDecl(attr, VD,
+                            diag::fixit_attr_objc_name_changed_by_access_note);
+
+      if (attr->getLParenLoc().isValid())
+        note.fixItReplace({ attr->getLParenLoc(), attr->getRParenLoc() },
+                          newNameString);
+      else
+        note.fixItInsertAfter(attr->getLocation(), newNameString);
+    }
+    else if (attr->getName() != *note.ObjCName) {
+      diagnoseAtAttrOrDecl(attr, VD,
+                           diag::attr_objc_name_conflicts_with_access_note,
+                           notes.Reason, VD->getDescriptiveKind(),
+                           *note.ObjCName, *attr->getName());
+    }
+  }
+}
+
+evaluator::SideEffect
+ApplyAccessNoteRequest::evaluate(Evaluator &evaluator, ValueDecl *VD) const {
+  AccessNotesFile &notes = VD->getModuleContext()->getAccessNotes();
+  if (auto note = notes.lookup(VD))
+    applyAccessNote(VD, *note.get(), notes);
+  return {};
+}
+
 namespace {
 class DeclChecker : public DeclVisitor<DeclChecker> {
 public:
@@ -1384,7 +1571,11 @@ public:
     FrontendStatsTracer StatsTracer(getASTContext().Stats,
                                     "typecheck-decl", decl);
     PrettyStackTraceDecl StackTrace("type-checking", decl);
-    
+
+    if (auto VD = dyn_cast<ValueDecl>(decl))
+      (void)evaluateOrDefault(VD->getASTContext().evaluator,
+                              ApplyAccessNoteRequest{VD}, {});
+
     DeclVisitor<DeclChecker>::visit(decl);
 
     TypeChecker::checkUnsupportedProtocolType(decl);
@@ -1622,7 +1813,8 @@ public:
           Ctx.evaluator, PatternBindingEntryRequest{PBD, i}, nullptr);
       assert(entry && "No pattern binding entry?");
 
-      PBD->getPattern(i)->forEachVariable([&](VarDecl *var) {
+      const auto *Pat = PBD->getPattern(i);
+      Pat->forEachVariable([&](VarDecl *var) {
         this->visitBoundVariable(var);
 
         if (PBD->isInitialized(i)) {
@@ -1680,7 +1872,10 @@ public:
           }
 
           var->diagnose(diag::static_requires_initializer,
-                        var->getCorrectStaticSpelling());
+                        var->getCorrectStaticSpelling(),
+                        var->isLet());
+          var->diagnose(diag::static_requires_initializer_add_init)
+            .fixItInsert(Pat->getEndLoc(), " = <#initializer#>");
           markVarAndPBDInvalid();
           return;
         }
@@ -1697,6 +1892,8 @@ public:
           }
 
           var->diagnose(diag::global_requires_initializer, var->isLet());
+          var->diagnose(diag::static_requires_initializer_add_init)
+            .fixItInsert(Pat->getEndLoc(), " = <#initializer#>");
           markVarAndPBDInvalid();
           return;
         }
@@ -1739,9 +1936,9 @@ public:
           auto *initContext = cast_or_null<PatternBindingInitializer>(
               PBD->getInitContext(i));
           if (initContext) {
-            // Check safety of error-handling in the declaration, too.
-            TypeChecker::checkInitializerEffects(initContext, init);
             TypeChecker::contextualizeInitializer(initContext, init);
+            checkInitializerActorIsolation(initContext, init);
+            TypeChecker::checkInitializerEffects(initContext, init);
           }
         }
       }
@@ -1818,6 +2015,8 @@ public:
     (void) TAD->getGenericSignature();
     (void) TAD->getUnderlyingType();
 
+    // Make sure to check the underlying type.
+    
     TypeChecker::checkDeclAttributes(TAD);
     checkAccessControl(TAD);
     checkGenericParams(TAD);
@@ -2101,7 +2300,7 @@ public:
 
     TypeChecker::checkDeclAttributes(CD);
 
-    for (Decl *Member : CD->getSemanticMembers())
+    for (Decl *Member : CD->getABIMembers())
       visit(Member);
 
     TypeChecker::checkPatternBindingCaptures(CD);
@@ -2269,9 +2468,6 @@ public:
       llvm::errs() << "\n";
     }
 
-    // Explicitly calculate this bit.
-    (void) PD->existentialTypeSupported();
-
     // Explicity compute the requirement signature to detect errors.
     (void) PD->getRequirementSignature();
 
@@ -2344,6 +2540,14 @@ public:
     if (getASTContext().TypeCheckerOpts.SkipFunctionBodies ==
         FunctionBodySkipping::All)
       return true;
+
+    // If we want all types (for LLDB) we can't skip functions with nested
+    // types. We could probably improve upon this and type-check only the
+    // nested types instead for better performances.
+    if (AFD->hasNestedTypeDeclarations() &&
+        getASTContext().TypeCheckerOpts.SkipFunctionBodies ==
+          FunctionBodySkipping::NonInlinableWithoutTypes)
+      return false;
 
     // Only skip functions where their body won't be serialized
     return AFD->getResilienceExpansion() != ResilienceExpansion::Minimal;

@@ -243,6 +243,8 @@ namespace {
     IMPL(BuiltinIntegerLiteral, Trivial)
     IMPL(BuiltinFloat, Trivial)
     IMPL(BuiltinRawPointer, Trivial)
+    IMPL(BuiltinRawUnsafeContinuation, Trivial)
+    IMPL(BuiltinJob, Trivial)
     IMPL(BuiltinNativeObject, Reference)
     IMPL(BuiltinBridgeObject, Reference)
     IMPL(BuiltinVector, Trivial)
@@ -256,6 +258,15 @@ namespace {
 
     RetTy visitBuiltinUnsafeValueBufferType(
                                          CanBuiltinUnsafeValueBufferType type,
+                                         AbstractionPattern origType,
+                                         IsTypeExpansionSensitive_t isSensitive) {
+      return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
+                                               IsAddressOnly, IsNotResilient,
+                                               isSensitive});
+    }
+
+    RetTy visitBuiltinDefaultActorStorageType(
+                                         CanBuiltinDefaultActorStorageType type,
                                          AbstractionPattern origType,
                                          IsTypeExpansionSensitive_t isSensitive) {
       return asImpl().handleAddressOnly(type, {IsNotTrivial, IsFixedABI,
@@ -282,9 +293,12 @@ namespace {
     RetTy visitSILFunctionType(CanSILFunctionType type,
                                AbstractionPattern origType,
                                IsTypeExpansionSensitive_t isSensitive) {
-      // Handle `@differentiable` and `@differentiable(linear)` functions.
+      // Handle `@differentiable` and `@differentiable(_linear)` functions.
       switch (type->getDifferentiabilityKind()) {
+      // TODO: Ban `Normal` and `Forward` cases.
       case DifferentiabilityKind::Normal:
+      case DifferentiabilityKind::Forward:
+      case DifferentiabilityKind::Reverse:
         return asImpl().visitNormalDifferentiableSILFunctionType(
             type, mergeIsTypeExpansionSensitive(
                       isSensitive,
@@ -294,7 +308,7 @@ namespace {
         return asImpl().visitLinearDifferentiableSILFunctionType(
             type, mergeIsTypeExpansionSensitive(
                       isSensitive,
-                      getLinearDifferentiableSILFunctionTypeRecursiveProperties(
+                      getNormalDifferentiableSILFunctionTypeRecursiveProperties(
                           type, origType)));
       case DifferentiabilityKind::NonDifferentiable:
         break;
@@ -412,8 +426,15 @@ namespace {
       return visitAbstractTypeParamType(type, origType, isSensitive);
     }
 
-    Type getConcreteReferenceStorageReferent(Type type) {
+    Type getConcreteReferenceStorageReferent(Type type,
+                                             AbstractionPattern origType) {
       if (type->isTypeParameter()) {
+        auto genericSig = origType.getGenericSignature();
+        if (auto concreteType = genericSig->getConcreteType(type))
+          return concreteType;
+        if (auto superclassType = genericSig->getSuperclassBound(type))
+          return superclassType;
+        assert(genericSig->requiresClass(type));
         return TC.Context.getAnyObjectType();
       }
 
@@ -458,7 +479,7 @@ namespace {
                                    IsTypeExpansionSensitive_t isSensitive) { \
       auto referentType = \
         type->getReferentType()->lookThroughSingleOptionalType(); \
-      auto concreteType = getConcreteReferenceStorageReferent(referentType); \
+      auto concreteType = getConcreteReferenceStorageReferent(referentType, origType); \
       if (Name##StorageType::get(concreteType, TC.Context) \
             ->isLoadable(Expansion.getResilienceExpansion())) { \
         return asImpl().visitLoadable##Name##StorageType(type, origType, \
@@ -1076,7 +1097,7 @@ namespace {
         return;
       }
 
-      B.emitReleaseValueAndFold(loc, aggValue);
+      B.createReleaseValue(loc, aggValue, B.getDefaultAtomicity());
     }
 
     void
@@ -1254,7 +1275,7 @@ namespace {
         B.createDestroyValue(loc, value);
         return;
       }
-      B.emitReleaseValueAndFold(loc, value);
+      B.createReleaseValue(loc, value, B.getDefaultAtomicity());
     }
 
     void emitLoweredDestroyValue(SILBuilder &B, SILLocation loc, SILValue value,
@@ -1323,7 +1344,7 @@ namespace {
     }
   };
 
-  /// A type lowering for `@differentiable(linear)` function types.
+  /// A type lowering for `@differentiable(_linear)` function types.
   class LinearDifferentiableSILFunctionTypeLowering final
       : public LoadableAggTypeLowering<
                    LinearDifferentiableSILFunctionTypeLowering,
@@ -1415,7 +1436,7 @@ namespace {
         B.createDestroyValue(loc, value);
         return;
       }
-      B.emitStrongReleaseAndFold(loc, value);
+      B.createStrongRelease(loc, value, B.getDefaultAtomicity());
     }
   };
 
@@ -1501,13 +1522,13 @@ namespace {
     void emitDestroyAddress(SILBuilder &B, SILLocation loc,
                             SILValue addr) const override {
       if (!isTrivial())
-        B.emitDestroyAddrAndFold(loc, addr);
+        B.createDestroyAddr(loc, addr);
     }
 
     void emitDestroyRValue(SILBuilder &B, SILLocation loc,
                            SILValue value) const override {
       if (!isTrivial())
-        B.emitDestroyAddrAndFold(loc, value);
+        B.createDestroyAddr(loc, value);
     }
 
     SILValue emitCopyValue(SILBuilder &B, SILLocation loc,
@@ -2511,6 +2532,7 @@ getFunctionInterfaceTypeWithCaptures(TypeConverter &TC,
   auto innerExtInfo =
       AnyFunctionType::ExtInfoBuilder(FunctionType::Representation::Thin,
                                       funcType->isThrowing())
+          .withConcurrent(funcType->isConcurrent())
           .withAsync(funcType->isAsync())
           .build();
 
@@ -2771,6 +2793,14 @@ TypeConverter::getLoweredLocalCaptures(SILDeclRef fn) {
             collectFunctionCaptures(accessor);
         };
 
+        // 'Lazy' properties don't fit into the below categorization,
+        // and they have a synthesized getter, not a parsed one.
+        if (capturedVar->getAttrs().hasAttribute<LazyAttr>()) {
+          if (auto *getter = capturedVar->getSynthesizedAccessor(
+                AccessorKind::Get))
+            collectFunctionCaptures(getter);
+        }
+
         if (!capture.isDirect()) {
           auto impl = capturedVar->getImplInfo();
 
@@ -3014,6 +3044,10 @@ TypeConverter::checkForABIDifferences(SILModule &M,
   // trivial.
   if (auto fnTy1 = type1.getAs<SILFunctionType>()) {
     if (auto fnTy2 = type2.getAs<SILFunctionType>()) {
+      // Async/synchronous conversions always need a thunk.
+      if (fnTy1->isAsync() != fnTy2->isAsync())
+        return ABIDifference::NeedsThunk;
+
       // @convention(block) is a single retainable pointer so optionality
       // change is allowed.
       if (optionalityChange)
@@ -3142,8 +3176,7 @@ TypeConverter::checkFunctionForABIDifferences(SILModule &M,
   // We might still want to conditionalize this behavior even after we commit
   // substituted function types, to avoid bloating
   // IR for platforms that don't differentiate function type representations.
-  bool DifferentFunctionTypesHaveDifferentRepresentation
-    = Context.LangOpts.EnableSubstSILFunctionTypesForFunctionValues;
+  bool DifferentFunctionTypesHaveDifferentRepresentation = true;
   
   // TODO: For C language types we should consider the attached Clang types.
   if (fnTy1->getLanguage() == SILFunctionLanguage::C)

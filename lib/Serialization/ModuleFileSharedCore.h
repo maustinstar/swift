@@ -240,6 +240,10 @@ private:
   using SerializedDeclMembersTable =
       llvm::OnDiskIterableChainedHashTable<DeclMembersTableInfo>;
 
+  class DeclFingerprintsTableInfo;
+  using SerializedDeclFingerprintsTable =
+      llvm::OnDiskIterableChainedHashTable<DeclFingerprintsTableInfo>;
+
   std::unique_ptr<SerializedDeclTable> TopLevelDecls;
   std::unique_ptr<SerializedDeclTable> OperatorDecls;
   std::unique_ptr<SerializedDeclTable> PrecedenceGroupDecls;
@@ -250,6 +254,7 @@ private:
   std::unique_ptr<SerializedOpaqueReturnTypeDeclTable> OpaqueReturnTypeDecls;
   std::unique_ptr<SerializedNestedTypeDeclsTable> NestedTypeDecls;
   std::unique_ptr<SerializedDeclMemberNamesTable> DeclMemberNames;
+  std::unique_ptr<SerializedDeclFingerprintsTable> DeclFingerprints;
 
   class ObjCMethodTableInfo;
   using SerializedObjCMethodTable =
@@ -258,6 +263,7 @@ private:
   std::unique_ptr<SerializedObjCMethodTable> ObjCMethods;
 
   ArrayRef<serialization::DeclID> OrderedTopLevelDecls;
+  ArrayRef<serialization::DeclID> ExportedPrespecializationDecls;
 
   class DeclCommentTableInfo;
   using SerializedDeclCommentTable =
@@ -282,6 +288,9 @@ private:
 
   /// A blob of 0 terminated string segments referenced in \c SourceLocsTextData
   StringRef SourceLocsTextData;
+
+  /// A blob of source file list.
+  StringRef SourceFileListData;
 
   /// An array of fixed size source location data for each USR appearing in
   /// \c DeclUSRsTable.
@@ -320,8 +329,11 @@ private:
     /// Whether this module is compiled with implicit dynamic.
     unsigned IsImplicitDynamicEnabled: 1;
 
+    /// Whether this module is compiled while allowing errors.
+    unsigned IsAllowModuleWithCompilerErrorsEnabled: 1;
+
     // Explicitly pad out to the next word boundary.
-    unsigned : 0;
+    unsigned : 3;
   } Bits = {};
   static_assert(sizeof(ModuleBits) <= 8, "The bit set should be small");
 
@@ -395,6 +407,12 @@ private:
   /// index_block::DeclMembersLayout format.
   std::unique_ptr<SerializedDeclMembersTable>
   readDeclMembersTable(ArrayRef<uint64_t> fields, StringRef blobData) const;
+
+  /// Read an on-disk local declid-string hash table stored in
+  /// index_block::DeclFingerprintsLayout format.
+  std::unique_ptr<SerializedDeclFingerprintsTable>
+  readDeclFingerprintsTable(ArrayRef<uint64_t> fields,
+                            StringRef blobData) const;
 
   /// Read an on-disk derivative function configuration table stored in
   /// index_block::DerivativeFunctionConfigTableLayout format.

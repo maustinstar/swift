@@ -208,6 +208,9 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::BuiltinIntegerLiteral:
   case TypeKind::BuiltinFloat:
   case TypeKind::BuiltinRawPointer:
+  case TypeKind::BuiltinRawUnsafeContinuation:
+  case TypeKind::BuiltinJob:
+  case TypeKind::BuiltinDefaultActorStorage:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
   case TypeKind::Tuple:
@@ -442,13 +445,13 @@ Type TypeBase::addCurriedSelfType(const DeclContext *dc) {
   return FunctionType::get({selfParam}, type);
 }
 
-void
-TypeBase::getTypeVariables(SmallVectorImpl<TypeVariableType *> &typeVariables) {
+void TypeBase::getTypeVariables(
+    SmallPtrSetImpl<TypeVariableType *> &typeVariables) {
   // If we know we don't have any type variables, we're done.
   if (hasTypeVariable()) {
     auto addTypeVariables = [&](Type type) -> bool {
       if (auto tv = dyn_cast<TypeVariableType>(type.getPointer())) {
-        typeVariables.push_back(tv);
+        typeVariables.insert(tv);
       }
 
       return false;
@@ -809,13 +812,16 @@ Type TypeBase::getWithoutParens() {
 Type TypeBase::replaceCovariantResultType(Type newResultType,
                                           unsigned uncurryLevel) {
   if (uncurryLevel == 0) {
-    if (auto objectType = getOptionalObjectType()) {
+    bool isLValue = is<LValueType>();
+
+    auto loadedTy = getWithoutSpecifierType();
+    if (auto objectType = loadedTy->getOptionalObjectType()) {
       assert(!newResultType->getOptionalObjectType());
-      return OptionalType::get(
+      newResultType = OptionalType::get(
           objectType->replaceCovariantResultType(newResultType, uncurryLevel));
     }
 
-    return newResultType;
+    return isLValue ? LValueType::get(newResultType) : newResultType;
   }
 
   // Determine the input and result types of this function.
@@ -3397,11 +3403,9 @@ Type ProtocolCompositionType::get(const ASTContext &C,
   SmallVector<Type, 4> CanTypes;
   if (Superclass)
     CanTypes.push_back(Superclass->getCanonicalType());
-  std::transform(Protocols.begin(), Protocols.end(),
-                 std::back_inserter(CanTypes),
-                 [](ProtocolDecl *Proto) {
-                   return Proto->getDeclaredInterfaceType();
-                 });
+  llvm::transform(
+      Protocols, std::back_inserter(CanTypes),
+      [](ProtocolDecl *Proto) { return Proto->getDeclaredInterfaceType(); });
 
   // TODO: Canonicalize away HasExplicitAnyObject if it is implied
   // by one of our member protocols.
@@ -4310,16 +4314,29 @@ case TypeKind::Id:
   }
 
   case TypeKind::SILBox: {
+    bool changed = false;
+    auto boxTy = cast<SILBoxType>(base);
 #ifndef NDEBUG
     // This interface isn't suitable for updating the substitution map in a
     // generic SILBox.
-    auto boxTy = cast<SILBoxType>(base);
     for (Type type : boxTy->getSubstitutions().getReplacementTypes()) {
       assert(type->isEqual(type.transformRec(fn))
-             && "SILBoxType can't be transformed");
+             && "SILBoxType substitutions can't be transformed");
     }
 #endif
-    return base;
+    SmallVector<SILField, 4> newFields;
+    auto *l = boxTy->getLayout();
+    for (auto f : l->getFields()) {
+      auto fieldTy = f.getLoweredType();
+      auto transformed = fieldTy.transformRec(fn)->getCanonicalType();
+      changed |= fieldTy != transformed;
+      newFields.push_back(SILField(transformed, f.isMutable()));
+    }
+    boxTy = SILBoxType::get(Ptr->getASTContext(),
+                            SILLayout::get(Ptr->getASTContext(),
+                                           l->getGenericSignature(), newFields),
+                            boxTy->getSubstitutions());
+    return boxTy;
   }
   
   case TypeKind::SILFunction: {
@@ -4925,7 +4942,7 @@ bool UnownedStorageType::isLoadable(ResilienceExpansion resilience) const {
 }
 
 static ReferenceCounting getClassReferenceCounting(ClassDecl *theClass) {
-  return (theClass->checkAncestry(AncestryFlags::ClangImported)
+  return (theClass->usesObjCObjectModel()
           ? ReferenceCounting::ObjC
           : ReferenceCounting::Native);
 }
@@ -5000,6 +5017,9 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::BuiltinIntegerLiteral:
   case TypeKind::BuiltinFloat:
   case TypeKind::BuiltinRawPointer:
+  case TypeKind::BuiltinRawUnsafeContinuation:
+  case TypeKind::BuiltinJob:
+  case TypeKind::BuiltinDefaultActorStorage:
   case TypeKind::BuiltinUnsafeValueBuffer:
   case TypeKind::BuiltinVector:
   case TypeKind::Tuple:
@@ -5106,6 +5126,11 @@ AnyFunctionType *AnyFunctionType::getWithoutDifferentiability() const {
   assert(isa<GenericFunctionType>(this));
   return GenericFunctionType::get(getOptGenericSignature(), newParams,
                                   getResult(), nonDiffExtInfo);
+}
+
+AnyFunctionType *AnyFunctionType::getWithoutThrowing() const {
+  auto info = getExtInfo().intoBuilder().withThrows(false).build();
+  return withExtInfo(info);
 }
 
 Optional<TangentSpace>

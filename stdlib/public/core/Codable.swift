@@ -3133,7 +3133,7 @@ public protocol SingleValueDecodingContainer {
 //===----------------------------------------------------------------------===//
 
 /// A user-defined key for providing context during encoding and decoding.
-public struct CodingUserInfoKey: RawRepresentable, Equatable, Hashable {
+public struct CodingUserInfoKey: RawRepresentable, Equatable, Hashable, ConcurrentValue {
   public typealias RawValue = String
 
   /// The key's string value.
@@ -3367,7 +3367,7 @@ public enum DecodingError: Error {
 
 // The following extensions allow for easier error construction.
 
-internal struct _GenericIndexKey: CodingKey {
+internal struct _GenericIndexKey: CodingKey, ConcurrentValue {
     internal var stringValue: String
     internal var intValue: Int?
 
@@ -4730,9 +4730,8 @@ extension RawRepresentable where RawValue == Float, Self: Decodable {
   }
 }
 
-@available(iOS 14.0, watchOS 7.0, tvOS 14.0, *)
-@available(macOS, unavailable)
-@available(macCatalyst, unavailable)
+#if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+@available(macOS 11.0, iOS 14.0, watchOS 7.0, tvOS 14.0, *)
 extension Float16: Codable {
   /// Creates a new instance by decoding from the given decoder.
   ///
@@ -4763,6 +4762,7 @@ extension Float16: Codable {
     try Float(self).encode(to: encoder)
   }
 }
+#endif
 
 extension Int: Codable {
   /// Creates a new instance by decoding from the given decoder.

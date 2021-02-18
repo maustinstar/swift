@@ -28,6 +28,7 @@
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SIL/SILProperty.h"
 #include "swift/SIL/SILUndef.h"
 
 #include "llvm/ADT/Statistic.h"
@@ -81,6 +82,23 @@ fromStableVTableEntryKind(unsigned value) {
   case SIL_VTABLE_ENTRY_INHERITED: return SILVTable::Entry::Kind::Inherited;
   case SIL_VTABLE_ENTRY_OVERRIDE: return SILVTable::Entry::Kind::Override;
   default: return None;
+  }
+}
+
+static Optional<swift::DifferentiabilityKind>
+fromStableDifferentiabilityKind(uint8_t diffKind) {
+  switch (diffKind) {
+#define CASE(THE_DK) \
+  case (uint8_t)serialization::DifferentiabilityKind::THE_DK: \
+    return swift::DifferentiabilityKind::THE_DK;
+  CASE(NonDifferentiable)
+  CASE(Forward)
+  CASE(Reverse)
+  CASE(Normal)
+  CASE(Linear)
+#undef CASE
+  default:
+    return None;
   }
 }
 
@@ -277,9 +295,10 @@ SILValue SILDeserializer::getLocalValue(ValueID Id,
                                         SILType Type) {
   // The first two IDs are special undefined values.
   if (Id == 0)
-    return SILUndef::get(Type, SILMod, ValueOwnershipKind::None);
-  else if (Id == 1)
-    return SILUndef::get(Type, SILMod, ValueOwnershipKind::Owned);
+    return SILUndef::get(Type, SILMod);
+  assert(Id != 1 && "This used to be for SILUndef with OwnershipKind::Owned... "
+                    "but we don't support that anymore. Make sure no one "
+                    "changes that without updating this code if needed");
 
   // Check to see if this is already defined.
   ValueBase *Entry = LocalValues.lookup(Id);
@@ -319,7 +338,7 @@ SILBasicBlock *SILDeserializer::getBBForDefinition(SILFunction *Fn,
   (void)wasForwardReferenced;
 
   if (Prev)
-    BB->moveAfter(Prev);
+    Fn->moveBlockAfter(BB, Prev);
   return BB;
 }
 
@@ -877,10 +896,9 @@ static_assert(
 // We put these static asserts here to formalize our assumption that both
 // SILValueCategory and ValueOwnershipKind have uint8_t as their underlying
 // pointer values.
-static_assert(
-    std::is_same<std::underlying_type<ValueOwnershipKind::innerty>::type,
-                 uint8_t>::value,
-    "Expected an underlying uint8_t type");
+static_assert(std::is_same<std::underlying_type<OwnershipKind::innerty>::type,
+                           uint8_t>::value,
+              "Expected an underlying uint8_t type");
 SILBasicBlock *SILDeserializer::readSILBasicBlock(SILFunction *Fn,
                                                   SILBasicBlock *Prev,
                                     SmallVectorImpl<uint64_t> &scratch) {
@@ -1186,7 +1204,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   case SIL_INST_DIFFERENTIABLE_FUNCTION_EXTRACT:
     SILInstDifferentiableFunctionExtractLayout::readRecord(
         scratch, TyID, TyCategory, ValID, /*extractee*/ Attr,
-        /*hasExplicitExtracteeType*/ Attr2);
+        /*hasExplicitExtracteeType*/ Attr2, /*explicitExtracteeType*/ TyID2);
     RawOpCode = (unsigned)SILInstructionKind::DifferentiableFunctionExtractInst;
     break;
   case SIL_INST_LINEAR_FUNCTION_EXTRACT:
@@ -1225,8 +1243,9 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
       
   case SILInstructionKind::GetAsyncContinuationInst:
     assert(RecordKind == SIL_ONE_TYPE && "Layout should be OneType.");
-    ResultInst = Builder.createGetAsyncContinuation(Loc,
-              getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
+    ResultInst = Builder.createGetAsyncContinuation(
+        Loc, MF->getType(TyID)->getCanonicalType(),
+        /*throws*/ Attr != 0);
     break;
   
   case SILInstructionKind::GetAsyncContinuationAddrInst:
@@ -1235,7 +1254,8 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     ResultInst = Builder.createGetAsyncContinuationAddr(Loc,
       getLocalValue(ValID, getSILType(MF->getType(TyID2),
                                       (SILValueCategory)TyCategory2, Fn)),
-      getSILType(MF->getType(TyID), (SILValueCategory)TyCategory, Fn));
+      MF->getType(TyID)->getCanonicalType(),
+      /*throws*/ Attr != 0);
     break;
 
 #define ONETYPE_ONEOPERAND_INST(ID)                                            \
@@ -2745,8 +2765,11 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     auto val = getLocalValue(ValID, silTy);
     NormalDifferentiableFunctionTypeComponent extractee(Attr);
     Optional<SILType> explicitExtracteeType = None;
-    if (Attr2)
-      explicitExtracteeType = silTy;
+    if (Attr2) {
+      auto extracteeASTType = MF->getType(TyID2);
+      explicitExtracteeType =
+          getSILType(extracteeASTType, SILValueCategory::Object, Fn);
+    }
     ResultInst = Builder.createDifferentiableFunctionExtract(
         Loc, extractee, val, explicitExtracteeType);
     break;
@@ -2932,11 +2955,11 @@ SILGlobalVariable *SILDeserializer::readGlobalVar(StringRef Name) {
 
   assert(VId <= GlobalVars.size() && "invalid GlobalVar ID");
   auto &globalVarOrOffset = GlobalVars[VId-1];
-  if (globalVarOrOffset.isComplete())
-    return globalVarOrOffset;
+  if (globalVarOrOffset.isFullyDeserialized())
+    return globalVarOrOffset.get();
 
   BCOffsetRAII restoreOffset(SILCursor);
-  if (llvm::Error Err = SILCursor.JumpToBit(globalVarOrOffset))
+  if (llvm::Error Err = SILCursor.JumpToBit(globalVarOrOffset.getOffset()))
     MF->fatal(std::move(Err));
   llvm::Expected<llvm::BitstreamEntry> maybeEntry =
       SILCursor.advance(AF_DontPopBlockAtEnd);
@@ -2983,7 +3006,7 @@ SILGlobalVariable *SILDeserializer::readGlobalVar(StringRef Name) {
       None,
       dID ? cast<VarDecl>(MF->getDecl(dID)): nullptr);
   v->setLet(IsLet);
-  globalVarOrOffset = v;
+  globalVarOrOffset.set(v, true /*isFullyDeserialized*/);
   v->setDeclaration(IsDeclaration);
 
   if (Callback)
@@ -3082,11 +3105,11 @@ SILVTable *SILDeserializer::readVTable(DeclID VId) {
   assert(VId <= VTables.size() && "invalid VTable ID");
   auto &vTableOrOffset = VTables[VId-1];
 
-  if (vTableOrOffset.isComplete())
-    return vTableOrOffset;
+  if (vTableOrOffset.isFullyDeserialized())
+    return vTableOrOffset.get();
 
   BCOffsetRAII restoreOffset(SILCursor);
-  if (llvm::Error Err = SILCursor.JumpToBit(vTableOrOffset))
+  if (llvm::Error Err = SILCursor.JumpToBit(vTableOrOffset.getOffset()))
     MF->fatal(std::move(Err));
   llvm::Expected<llvm::BitstreamEntry> maybeEntry =
       SILCursor.advance(AF_DontPopBlockAtEnd);
@@ -3183,7 +3206,7 @@ SILVTable *SILDeserializer::readVTable(DeclID VId) {
       SILMod, theClass,
       Serialized ? IsSerialized : IsNotSerialized,
       vtableEntries);
-  vTableOrOffset = vT;
+  vTableOrOffset.set(vT, true /*isFullyDeserialized*/);
 
   if (Callback) Callback->didDeserialize(MF->getAssociatedModule(), vT);
   return vT;
@@ -3689,15 +3712,15 @@ SILDeserializer::readDifferentiabilityWitness(DeclID DId) {
   (void)kind;
 
   DeclID originalNameId, jvpNameId, vjpNameId;
-  unsigned rawLinkage, isDeclaration, isSerialized, numParameterIndices,
-      numResultIndices;
+  unsigned rawLinkage, isDeclaration, isSerialized, rawDiffKind,
+      numParameterIndices, numResultIndices;
   GenericSignatureID derivativeGenSigID;
   ArrayRef<uint64_t> rawParameterAndResultIndices;
 
   DifferentiabilityWitnessLayout::readRecord(
       scratch, originalNameId, rawLinkage, isDeclaration, isSerialized,
-      derivativeGenSigID, jvpNameId, vjpNameId, numParameterIndices,
-      numResultIndices, rawParameterAndResultIndices);
+      rawDiffKind, derivativeGenSigID, jvpNameId, vjpNameId,
+      numParameterIndices, numResultIndices, rawParameterAndResultIndices);
 
   if (isDeclaration) {
     assert(!isSerialized && "declaration must not be serialized");
@@ -3706,6 +3729,9 @@ SILDeserializer::readDifferentiabilityWitness(DeclID DId) {
   auto linkageOpt = fromStableSILLinkage(rawLinkage);
   assert(linkageOpt &&
          "Expected value linkage for sil_differentiability_witness");
+  auto diffKind = fromStableDifferentiabilityKind(rawDiffKind);
+  assert(diffKind &&
+         "Expected differentiability kind for sil_differentiability_witness");
   auto originalName = MF->getIdentifierText(originalNameId);
   auto jvpName = MF->getIdentifierText(jvpNameId);
   auto vjpName = MF->getIdentifierText(vjpNameId);
@@ -3741,8 +3767,8 @@ SILDeserializer::readDifferentiabilityWitness(DeclID DId) {
                            .take_back(numResultIndices));
 
   AutoDiffConfig config(parameterIndices, resultIndices, derivativeGenSig);
-  auto *diffWitness =
-      SILMod.lookUpDifferentiabilityWitness({originalName, config});
+  auto *diffWitness = SILMod.lookUpDifferentiabilityWitness(
+      {originalName, *diffKind, config});
 
   // Witnesses that we deserialize are always available externally; we never
   // want to emit them ourselves.
@@ -3751,7 +3777,7 @@ SILDeserializer::readDifferentiabilityWitness(DeclID DId) {
   // If there is no existing differentiability witness, create one.
   if (!diffWitness)
     diffWitness = SILDifferentiabilityWitness::createDeclaration(
-        SILMod, linkage, original, parameterIndices, resultIndices,
+        SILMod, linkage, original, *diffKind, parameterIndices, resultIndices,
         derivativeGenSig);
 
   // If the current differentiability witness is merely a declaration, and the
@@ -3809,6 +3835,130 @@ bool SILDeserializer::invalidateFunction(SILFunction *F) {
     if (fnEntry.isDeserialized() && fnEntry.get() == F) {
       fnEntry.get()->decrementRefCount();
       fnEntry.reset();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Invalidate all cached SILGlobalVariable.
+void SILDeserializer::invalidateGlobalVariableCache() {
+  for (auto &entry : GlobalVars) {
+    if (entry.isDeserialized()) {
+      entry.reset();
+    }
+  }
+}
+
+// Invalidate a specific cached GlobalVariable.
+bool SILDeserializer::invalidateGlobalVariable(SILGlobalVariable *gv) {
+  for (auto &entry : GlobalVars) {
+    if (entry.isDeserialized() && entry.get() == gv) {
+      entry.reset();
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Invalidate all cached SILVTable.
+void SILDeserializer::invalidateVTableCache() {
+  for (auto &entry : VTables) {
+    if (entry.isDeserialized()) {
+      entry.reset();
+    }
+  }
+}
+
+// Invalidate a specific cached SILVTable.
+bool SILDeserializer::invalidateVTable(SILVTable *v) {
+  for (auto &entry : VTables) {
+    if (entry.isDeserialized() && entry.get() == v) {
+      entry.reset();
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Invalidate all cached SILWitnessTable.
+void SILDeserializer::invalidateWitnessTableCache() {
+  for (auto &entry : WitnessTables) {
+    if (entry.isDeserialized()) {
+      entry.reset();
+    }
+  }
+}
+
+// Invalidate a specific cached SILWitnessTable.
+bool SILDeserializer::invalidateWitnessTable(SILWitnessTable *wt) {
+  for (auto &entry : WitnessTables) {
+    if (entry.isDeserialized() && entry.get() == wt) {
+      entry.reset();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Invalidate all cached SILDefaultWitnessTable.
+void SILDeserializer::invalidateDefaultWitnessTableCache() {
+  for (auto &entry : DefaultWitnessTables) {
+    if (entry.isDeserialized()) {
+      entry.reset();
+    }
+  }
+}
+
+// Invalidate a specific cached SILDefaultWitnessTable.
+bool SILDeserializer::invalidateDefaultWitnessTable(
+    SILDefaultWitnessTable *wt) {
+  for (auto &entry : DefaultWitnessTables) {
+    if (entry.isDeserialized() && entry.get() == wt) {
+      entry.reset();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Invalidate all cached SILProperty.
+void SILDeserializer::invalidatePropertyCache() {
+  for (auto &entry : Properties) {
+    if (entry.isDeserialized()) {
+      entry.reset();
+    }
+  }
+}
+
+// Invalidate a specific cached SILProperty.
+bool SILDeserializer::invalidateProperty(SILProperty *p) {
+  for (auto &entry : Properties) {
+    if (entry.isDeserialized() && entry.get() == p) {
+      entry.reset();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Invalidate all cached SILDifferentiabilityWitness.
+void SILDeserializer::invalidateDifferentiabilityWitnessCache() {
+  for (auto &entry : DifferentiabilityWitnesses) {
+    if (entry.isDeserialized()) {
+      entry.reset();
+    }
+  }
+}
+
+// Invalidate a specific cached SILDifferentiabilityWitness.
+bool SILDeserializer::invalidateDifferentiabilityWitness(
+    SILDifferentiabilityWitness *w) {
+  for (auto &entry : DifferentiabilityWitnesses) {
+    if (entry.isDeserialized() && entry.get() == w) {
+      entry.reset();
       return true;
     }
   }

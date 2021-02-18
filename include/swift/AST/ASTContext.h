@@ -522,6 +522,9 @@ public:
   /// Get Sequence.makeIterator().
   FuncDecl *getSequenceMakeIterator() const;
 
+  /// Get AsyncSequence.makeAsyncIterator().
+  FuncDecl *getAsyncSequenceMakeAsyncIterator() const;
+
   /// Check whether the standard library provides all the correct
   /// intrinsic support for Optional<T>.
   ///
@@ -580,7 +583,7 @@ public:
 
   // Retrieve the declaration of Swift._stdlib_isOSVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastDecl() const;
-  
+
   /// Look for the declaration with the given name within the
   /// Swift module.
   void lookupInSwiftModule(StringRef name,
@@ -629,8 +632,15 @@ public:
     ArrayRef<SILParameterInfo> params, Optional<SILResultInfo> result,
     SILFunctionType::Representation trueRep);
 
-  /// Instantiates "Impl.Converter" if needed, then calls
-  /// ClangTypeConverter::getClangTemplateArguments.
+  /// Instantiates "Impl.Converter" if needed, then translate Swift generic
+  /// substitutions to equivalent C++ types using \p templateParams and \p
+  /// genericArgs. The converted Clang types are placed into \p templateArgs.
+  ///
+  /// \p templateArgs must be empty. \p templateParams and \p genericArgs must
+  /// be equal in size.
+  ///
+  /// \returns nullptr if successful. If an error occors, returns a list of
+  /// types that couldn't be converted.
   std::unique_ptr<TemplateInstantiationError> getClangTemplateArguments(
       const clang::TemplateParameterList *templateParams,
       ArrayRef<Type> genericArgs,
@@ -639,6 +649,14 @@ public:
   /// Get the Swift declaration that a Clang declaration was exported from,
   /// if applicable.
   const Decl *getSwiftDeclForExportedClangDecl(const clang::Decl *decl);
+
+  /// General conversion method from Swift types -> Clang types.
+  ///
+  /// HACK: This method is only intended to be called from a specific place in
+  /// IRGen. For converting function types, strongly prefer using one of the
+  /// other methods instead, instead of manually iterating over parameters
+  /// and results.
+  const clang::Type *getClangTypeForIRGen(Type ty);
 
   /// Determine whether the given Swift type is representable in a
   /// given foreign language.
@@ -705,6 +723,9 @@ public:
   /// Get the runtime availability of support for concurrency.
   AvailabilityContext getConcurrencyAvailability();
 
+  /// Get the runtime availability of support for differentiation.
+  AvailabilityContext getDifferentiationAvailability();
+
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
   AvailabilityContext getSwift52Availability();
@@ -737,13 +758,10 @@ public:
   const CanType TheUnresolvedType;        /// This is the UnresolvedType singleton.
   const CanType TheEmptyTupleType;        /// This is '()', aka Void
   const CanType TheAnyType;               /// This is 'Any', the empty protocol composition
-  const CanType TheNativeObjectType;      /// Builtin.NativeObject
-  const CanType TheBridgeObjectType;      /// Builtin.BridgeObject
-  const CanType TheRawPointerType;        /// Builtin.RawPointer
-  const CanType TheUnsafeValueBufferType; /// Builtin.UnsafeValueBuffer
-  const CanType TheSILTokenType;          /// Builtin.SILToken
-  const CanType TheIntegerLiteralType;    /// Builtin.IntegerLiteralType
-  
+#define SINGLETON_TYPE(SHORT_ID, ID) \
+  const CanType The##SHORT_ID##Type;
+#include "swift/AST/TypeNodes.def"
+
   const CanType TheIEEE32Type;            /// 32-bit IEEE floating point
   const CanType TheIEEE64Type;            /// 64-bit IEEE floating point
   
@@ -787,7 +805,8 @@ public:
       StringRef moduleName,
       bool isUnderlyingClangModule,
       ModuleDependenciesCache &cache,
-      InterfaceSubContextDelegate &delegate);
+      InterfaceSubContextDelegate &delegate,
+      bool cacheOnly = false);
 
   /// Retrieve the module dependencies for the Swift module with the given name.
   Optional<ModuleDependencies> getSwiftModuleDependencies(
@@ -901,6 +920,13 @@ public:
   /// \returns The requested module, or NULL if the module cannot be found.
   ModuleDecl *getModule(ImportPath::Module ModulePath);
 
+  /// Attempts to load the matching overlay module for the given clang
+  /// module into this ASTContext.
+  ///
+  /// \returns The Swift overlay module corresponding to the given Clang module,
+  /// or NULL if the overlay module cannot be found.
+  ModuleDecl *getOverlayModule(const FileUnit *ClangModule);
+
   ModuleDecl *getModuleByName(StringRef ModuleName);
 
   ModuleDecl *getModuleByIdentifier(Identifier ModuleID);
@@ -960,7 +986,13 @@ public:
 
   /// Check whether current context has any errors associated with
   /// ill-formed protocol conformances which haven't been produced yet.
-  bool hasDelayedConformanceErrors() const;
+  ///
+  /// @param conformance if non-null, will check only for errors specific to the
+  /// provided conformance. Otherwise, checks for _any_ errors.
+  ///
+  /// @returns true iff there are any delayed diagnostic errors
+  bool hasDelayedConformanceErrors(
+                  NormalProtocolConformance const* conformance = nullptr) const;
 
   /// Add a delayed diagnostic produced while type-checking a
   /// particular protocol conformance.
@@ -970,7 +1002,7 @@ public:
   /// Retrieve the delayed-conformance diagnostic callbacks for the
   /// given normal protocol conformance.
   std::vector<DelayedConformanceDiag>
-  takeDelayedConformanceDiags(NormalProtocolConformance *conformance);
+  takeDelayedConformanceDiags(NormalProtocolConformance const* conformance);
 
   /// Add delayed missing witnesses for the given normal protocol conformance.
   void addDelayedMissingWitnesses(
@@ -1127,6 +1159,10 @@ public:
   /// Check whether a given string would be considered "pure ASCII" by the
   /// standard library's String implementation.
   bool isASCIIString(StringRef s) const;
+
+  /// Retrieve the name of to be used for the entry point, either main or an
+  /// alternative specified via the -entry-point-function-name frontend flag.
+  std::string getEntryPointFunctionName() const;
 
 private:
   friend Decl;

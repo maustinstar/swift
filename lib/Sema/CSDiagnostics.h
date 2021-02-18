@@ -690,20 +690,42 @@ protected:
   getDiagnosticFor(ContextualTypePurpose context, Type contextualType);
 };
 
-/// Diagnose errors related to converting function type which
-/// isn't explicitly '@escaping' to some other type.
-class NoEscapeFuncToTypeConversionFailure final : public ContextualFailure {
+/// Diagnose errors related to using an array literal where a
+/// dictionary is expected.
+class ArrayLiteralToDictionaryConversionFailure final : public ContextualFailure {
 public:
-  NoEscapeFuncToTypeConversionFailure(const Solution &solution, Type fromType,
-                                      Type toType, ConstraintLocator *locator)
-      : ContextualFailure(solution, fromType, toType, locator) {}
+  ArrayLiteralToDictionaryConversionFailure(const Solution &solution,
+                                            Type arrayTy, Type dictTy,
+                                            ConstraintLocator *locator)
+      : ContextualFailure(solution, arrayTy, dictTy, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose errors related to converting function type which
+/// isn't explicitly '@escaping' or '@concurrent' to some other type.
+class AttributedFuncToTypeConversionFailure final : public ContextualFailure {
+public:
+  enum AttributeKind {
+    Escaping,
+    Concurrent,
+  };
+
+  const AttributeKind attributeKind;
+
+  AttributedFuncToTypeConversionFailure(const Solution &solution, Type fromType,
+                                        Type toType, ConstraintLocator *locator,
+                                        AttributeKind attributeKind)
+      : ContextualFailure(solution, fromType, toType, locator),
+        attributeKind(attributeKind) {}
 
   bool diagnoseAsError() override;
 
 private:
-  /// Emit tailored diagnostics for no-escape parameter conversions e.g.
-  /// passing such parameter as an @escaping argument, or trying to
-  /// assign it to a variable which expects @escaping function.
+  /// Emit tailored diagnostics for no-escape/non-concurrent parameter
+  /// conversions e.g. passing such parameter as an @escaping or @concurrent
+  /// argument, or trying to assign it to a variable which expects @escaping
+  /// or @concurrent function.
   bool diagnoseParameterUse() const;
 };
 
@@ -792,6 +814,27 @@ public:
     auto fnType1 = fromType->castTo<FunctionType>();
     auto fnType2 = toType->castTo<FunctionType>();
     assert(fnType1->isThrowing() != fnType2->isThrowing());
+  }
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose failures related to conversion between 'async' function type
+/// and a synchronous one e.g.
+///
+/// ```swift
+/// func foo<T>(_ t: T) async -> Void {}
+/// let _: (Int) -> Void = foo // `foo` can't be implictly converted to
+///                            // synchronous function type `(Int) -> Void`
+/// ```
+class AsyncFunctionConversionFailure final : public ContextualFailure {
+public:
+  AsyncFunctionConversionFailure(const Solution &solution, Type fromType,
+                                 Type toType, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator) {
+    auto fnType1 = fromType->castTo<FunctionType>();
+    auto fnType2 = toType->castTo<FunctionType>();
+    assert(fnType1->isAsync() != fnType2->isAsync());
   }
 
   bool diagnoseAsError() override;
@@ -1927,12 +1970,15 @@ protected:
   bool diagnoseMisplacedMissingArgument() const;
 };
 
-/// Replace a coercion ('as') with a forced checked cast ('as!').
-class MissingForcedDowncastFailure final : public ContextualFailure {
+/// Replace a coercion ('as') with a runtime checked cast ('as!' or 'as?').
+class InvalidCoercionFailure final : public ContextualFailure {
+  bool UseConditionalCast;
+
 public:
-  MissingForcedDowncastFailure(const Solution &solution, Type fromType,
-                               Type toType, ConstraintLocator *locator)
-      : ContextualFailure(solution, fromType, toType, locator) {}
+  InvalidCoercionFailure(const Solution &solution, Type fromType, Type toType,
+                         bool useConditionalCast, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator),
+        UseConditionalCast(useConditionalCast) {}
 
   ASTNode getAnchor() const override;
 
@@ -2292,6 +2338,135 @@ public:
   ReferenceToInvalidDeclaration(const Solution &solution,
                                 ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose use of `return` statements in a body of a result builder.
+///
+/// \code
+/// struct S : Builder {
+///   var foo: some Builder {
+///     return EmptyBuilder()
+///   }
+/// }
+/// \endcode
+class InvalidReturnInResultBuilderBody final : public FailureDiagnostic {
+  Type BuilderType;
+
+public:
+  InvalidReturnInResultBuilderBody(const Solution &solution, Type builderTy,
+                                   ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator), BuilderType(builderTy) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose if the base type is optional, we're referring to a nominal
+/// type member via the dot syntax and the member name matches
+/// Optional<T>.{member_name} or an unresolved `.none` inferred as a static
+/// non-optional member  base but could be an Optional<T>.none. So we enforce
+/// explicit type annotation to avoid ambiguity.
+///
+/// \code
+///   enum Enum<T> {
+///     case bar
+///     static var none: Enum<Int> { .bar }
+///   }
+///   let _: Enum<Int>? = .none // Base inferred as Optional.none, suggest
+///   // explicit type.
+///   let _: Enum? = .none // Base inferred as static member Enum<Int>.none,
+///   // emit warning suggesting explicit type.
+///   let _: Enum = .none // Ok
+/// \endcode
+class MemberMissingExplicitBaseTypeFailure final : public FailureDiagnostic {
+  DeclNameRef Member;
+
+public:
+  MemberMissingExplicitBaseTypeFailure(const Solution &solution,
+                                       DeclNameRef member,
+                                       ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator), Member(member) {}
+
+  bool diagnoseAsError() override;
+};
+
+class CheckedCastBaseFailure : public ContextualFailure {
+protected:
+  CheckedCastKind CastKind;
+  CheckedCastExpr *CastExpr;
+
+public:
+  CheckedCastBaseFailure(const Solution &solution, Type fromType, Type toType,
+                         CheckedCastKind kind, ConstraintLocator *locator)
+      : ContextualFailure(solution, fromType, toType, locator), CastKind(kind) {
+    CastExpr = castToExpr<CheckedCastExpr>(locator->getAnchor());
+  }
+
+  bool isCastTypeIUO() const;
+
+  SourceRange getCastRange() const;
+
+protected:
+  SourceRange getFromRange() const {
+    return CastExpr->getSubExpr()->getSourceRange();
+  }
+
+  SourceRange getToRange() const {
+    return CastExpr->getCastTypeRepr()->getSourceRange();
+  }
+};
+
+/// Warn situations where the compiler can statically know a runtime
+/// optional checked cast involved in checked cast are coercible.
+class CoercibleOptionalCheckedCastFailure final
+    : public CheckedCastBaseFailure {
+public:
+  CoercibleOptionalCheckedCastFailure(const Solution &solution, Type fromType,
+                                      Type toType, CheckedCastKind kind,
+                                      ConstraintLocator *locator)
+      : CheckedCastBaseFailure(solution, fromType, toType, kind, locator) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  std::tuple<Type, Type, unsigned> unwrapedTypes() const;
+
+  bool diagnoseIfExpr() const;
+
+  bool diagnoseForcedCastExpr() const;
+
+  bool diagnoseConditionalCastExpr() const;
+};
+
+/// Warn situations where the compiler can statically know a runtime
+/// checked cast always succeed.
+class AlwaysSucceedCheckedCastFailure final : public CheckedCastBaseFailure {
+public:
+  AlwaysSucceedCheckedCastFailure(const Solution &solution, Type fromType,
+                                  Type toType, CheckedCastKind kind,
+                                  ConstraintLocator *locator)
+      : CheckedCastBaseFailure(solution, fromType, toType, kind, locator) {}
+
+  bool diagnoseAsError() override;
+
+private:
+  bool diagnoseIfExpr() const;
+
+  bool diagnoseForcedCastExpr() const;
+
+  bool diagnoseConditionalCastExpr() const;
+};
+
+/// Warn situations where the compiler can statically know a runtime
+/// check is not supported.
+class UnsupportedRuntimeCheckedCastFailure final
+    : public CheckedCastBaseFailure {
+public:
+  UnsupportedRuntimeCheckedCastFailure(const Solution &solution, Type fromType,
+                                       Type toType, CheckedCastKind kind,
+                                       ConstraintLocator *locator)
+      : CheckedCastBaseFailure(solution, fromType, toType, kind, locator) {}
 
   bool diagnoseAsError() override;
 };

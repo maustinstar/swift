@@ -184,7 +184,7 @@ void collectAllActualResultsInTypeOrder(
 }
 
 void collectMinimalIndicesForFunctionCall(
-    ApplyInst *ai, SILAutoDiffIndices parentIndices,
+    ApplyInst *ai, AutoDiffConfig parentConfig,
     const DifferentiableActivityInfo &activityInfo,
     SmallVectorImpl<SILValue> &results, SmallVectorImpl<unsigned> &paramIndices,
     SmallVectorImpl<unsigned> &resultIndices) {
@@ -195,7 +195,7 @@ void collectMinimalIndicesForFunctionCall(
   // Record all parameter indices in type order.
   unsigned currentParamIdx = 0;
   for (auto applyArg : ai->getArgumentsWithoutIndirectResults()) {
-    if (activityInfo.isActive(applyArg, parentIndices))
+    if (activityInfo.isActive(applyArg, parentConfig))
       paramIndices.push_back(currentParamIdx);
     ++currentParamIdx;
   }
@@ -216,12 +216,12 @@ void collectMinimalIndicesForFunctionCall(
     if (res.isFormalDirect()) {
       results.push_back(directResults[dirResIdx]);
       if (auto dirRes = directResults[dirResIdx])
-        if (dirRes && activityInfo.isActive(dirRes, parentIndices))
+        if (dirRes && activityInfo.isActive(dirRes, parentConfig))
           resultIndices.push_back(idx);
       ++dirResIdx;
     } else {
       results.push_back(indirectResults[indResIdx]);
-      if (activityInfo.isActive(indirectResults[indResIdx], parentIndices))
+      if (activityInfo.isActive(indirectResults[indResIdx], parentConfig))
         resultIndices.push_back(idx);
       ++indResIdx;
     }
@@ -243,7 +243,7 @@ void collectMinimalIndicesForFunctionCall(
                     calleeFnTy->getNumIndirectMutatingParameters();
   assert(results.size() == numResults);
   assert(llvm::any_of(results, [&](SILValue result) {
-    return activityInfo.isActive(result, parentIndices);
+    return activityInfo.isActive(result, parentConfig);
   }));
 #endif
 }
@@ -329,14 +329,16 @@ VarDecl *getTangentStoredProperty(ADContext &context, VarDecl *originalField,
 }
 
 VarDecl *getTangentStoredProperty(ADContext &context,
-                                  FieldIndexCacheBase *projectionInst,
+                                  SingleValueInstruction *projectionInst,
                                   CanType baseType,
                                   DifferentiationInvoker invoker) {
   assert(isa<StructExtractInst>(projectionInst) ||
          isa<StructElementAddrInst>(projectionInst) ||
          isa<RefElementAddrInst>(projectionInst));
+  Projection proj(projectionInst);
   auto loc = getValidLocation(projectionInst);
-  return getTangentStoredProperty(context, projectionInst->getField(), baseType,
+  auto *field = proj.getVarDecl(projectionInst->getOperand(0)->getType());
+  return getTangentStoredProperty(context, field, baseType,
                                   loc, invoker);
 }
 
@@ -397,6 +399,35 @@ void emitZeroIntoBuffer(SILBuilder &builder, CanType type,
   builder.createApply(loc, getter, subMap, {bufferAccess, metatype},
                       /*isNonThrowing*/ false);
   builder.emitDestroyValueOperation(loc, getter);
+}
+
+SILValue emitMemoryLayoutSize(
+    SILBuilder &builder, SILLocation loc, CanType type) {
+  auto &ctx = builder.getASTContext();
+  auto id = ctx.getIdentifier(getBuiltinName(BuiltinValueKind::Sizeof));
+  auto *builtin = cast<FuncDecl>(getBuiltinValueDecl(ctx, id));
+  auto metatypeTy = SILType::getPrimitiveObjectType(
+      CanMetatypeType::get(type, MetatypeRepresentation::Thin));
+  auto metatypeVal = builder.createMetatype(loc, metatypeTy);
+  return builder.createBuiltin(
+      loc, id, SILType::getBuiltinWordType(ctx),
+      SubstitutionMap::get(
+          builtin->getGenericSignature(), ArrayRef<Type>{type}, {}),
+      {metatypeVal});
+}
+
+SILValue emitProjectTopLevelSubcontext(
+    SILBuilder &builder, SILLocation loc, SILValue context,
+    SILType subcontextType) {
+  assert(context.getOwnershipKind() == OwnershipKind::Guaranteed);
+  auto &ctx = builder.getASTContext();
+  auto id = ctx.getIdentifier(
+      getBuiltinName(BuiltinValueKind::AutoDiffProjectTopLevelSubcontext));
+  assert(context->getType() == SILType::getNativeObjectType(ctx));
+  auto *subcontextAddr = builder.createBuiltin(
+      loc, id, SILType::getRawPointerType(ctx), SubstitutionMap(), {context});
+  return builder.createPointerToAddress(
+      loc, subcontextAddr, subcontextType.getAddressType(), /*isStrict*/ true);
 }
 
 //===----------------------------------------------------------------------===//
@@ -463,8 +494,8 @@ findMinimalDerivativeConfiguration(AbstractFunctionDecl *original,
 }
 
 SILDifferentiabilityWitness *getOrCreateMinimalASTDifferentiabilityWitness(
-    SILModule &module, SILFunction *original, IndexSubset *parameterIndices,
-    IndexSubset *resultIndices) {
+    SILModule &module, SILFunction *original, DifferentiabilityKind kind,
+    IndexSubset *parameterIndices, IndexSubset *resultIndices) {
   // AST differentiability witnesses always have a single result.
   if (resultIndices->getCapacity() != 1 || !resultIndices->contains(0))
     return nullptr;
@@ -489,8 +520,8 @@ SILDifferentiabilityWitness *getOrCreateMinimalASTDifferentiabilityWitness(
     original = module.lookUpFunction(SILDeclRef(originalAFD).asForeign());
   }
 
-  auto *existingWitness =
-      module.lookUpDifferentiabilityWitness({originalName, *minimalConfig});
+  auto *existingWitness = module.lookUpDifferentiabilityWitness(
+      {originalName, kind, *minimalConfig});
   if (existingWitness)
     return existingWitness;
 
@@ -499,7 +530,7 @@ SILDifferentiabilityWitness *getOrCreateMinimalASTDifferentiabilityWitness(
          "definitions with explicit differentiable attributes");
 
   return SILDifferentiabilityWitness::createDeclaration(
-      module, SILLinkage::PublicExternal, original,
+      module, SILLinkage::PublicExternal, original, kind,
       minimalConfig->parameterIndices, minimalConfig->resultIndices,
       minimalConfig->derivativeGenericSignature);
 }

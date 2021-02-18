@@ -220,6 +220,9 @@ public:
     setCreateSyntax(Kind);
   }
 
+  SyntaxParsingContext(const SyntaxParsingContext &other) = delete;
+  SyntaxParsingContext &operator=(const SyntaxParsingContext &other) = delete;
+
   ~SyntaxParsingContext();
 
   /// Try looking up if an unmodified node exists at \p LexerOffset of the same
@@ -258,14 +261,13 @@ public:
   }
 
   /// Add RawSyntax to the parts.
-  void addRawSyntax(ParsedRawSyntaxNode Raw);
+  void addRawSyntax(ParsedRawSyntaxNode &&Raw);
 
   /// Add Token with Trivia to the parts.
-  void addToken(Token &Tok, const ParsedTrivia &LeadingTrivia,
-                const ParsedTrivia &TrailingTrivia);
+  void addToken(Token &Tok, StringRef LeadingTrivia, StringRef TrailingTrivia);
 
   /// Add Syntax to the parts.
-  void addSyntax(ParsedSyntax Node);
+  void addSyntax(ParsedSyntax &&Node);
 
   template<typename SyntaxNode>
   llvm::Optional<SyntaxNode> popIf() {

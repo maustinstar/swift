@@ -23,6 +23,7 @@
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DiagnosticsParse.h"
+#include "swift/AST/Effects.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/ImportCache.h"
@@ -51,7 +52,14 @@ namespace {
     assert(!D->hasClangNode() && "Clang importer propagated a bogus attribute");
     if (!D->hasClangNode()) {
       SourceLoc loc = attr->getLocation();
-      assert(loc.isValid() && "Diagnosing attribute with invalid location");
+#ifndef NDEBUG
+      if (!loc.isValid()) {
+        llvm::errs() << "Attribute '";
+        attr->print(llvm::errs());
+        llvm::errs() << "' has invalid location, failed to diagnose!\n";
+        assert(false && "Diagnosing attribute with invalid location");
+      }
+#endif
       if (loc.isInvalid()) {
         loc = D->getLoc();
       }
@@ -121,6 +129,7 @@ public:
   IGNORED_ATTR(OriginallyDefinedIn)
   IGNORED_ATTR(NoDerivative)
   IGNORED_ATTR(SpecializeExtension)
+  IGNORED_ATTR(Concurrent)
 #undef IGNORED_ATTR
 
   void visitAlignmentAttr(AlignmentAttr *attr) {
@@ -215,6 +224,7 @@ public:
   void visitNSCopyingAttr(NSCopyingAttr *attr);
   void visitRequiredAttr(RequiredAttr *attr);
   void visitRethrowsAttr(RethrowsAttr *attr);
+  void visitAtRethrowsAttr(AtRethrowsAttr *attr);
 
   void checkApplicationMainAttribute(DeclAttribute *attr,
                                      Identifier Id_ApplicationDelegate,
@@ -261,142 +271,15 @@ public:
   void visitDerivativeAttr(DerivativeAttr *attr);
   void visitTransposeAttr(TransposeAttr *attr);
 
-  void visitAsyncHandlerAttr(AsyncHandlerAttr *attr) {
-    auto func = dyn_cast<FuncDecl>(D);
-    if (!func) {
-      diagnoseAndRemoveAttr(attr, diag::asynchandler_non_func);
-      return;
-    }
+  void visitAsyncHandlerAttr(AsyncHandlerAttr *attr);
+  void visitActorAttr(ActorAttr *attr);
+  void visitActorIndependentAttr(ActorIndependentAttr *attr);
+  void visitGlobalActorAttr(GlobalActorAttr *attr);
+  void visitAsyncAttr(AsyncAttr *attr);
+  void visitMarkerAttr(MarkerAttr *attr);
 
-    // Trigger the request to check for @asyncHandler.
-    (void)func->isAsyncHandler();
-  }
-
-  void visitActorAttr(ActorAttr *attr) {
-    auto classDecl = dyn_cast<ClassDecl>(D);
-    if (!classDecl)
-      return; // already diagnosed
-
-    (void)classDecl->isActor();
-  }
-
-  void visitActorIndependentAttr(ActorIndependentAttr *attr) {
-    // @actorIndependent can be applied to global and static/class variables
-    // that do not have storage.
-    auto dc = D->getDeclContext();
-    if (auto var = dyn_cast<VarDecl>(D)) {
-      // @actorIndependent is meaningless on a `let`.
-      if (var->isLet()) {
-        diagnoseAndRemoveAttr(attr, diag::actorindependent_let);
-        return;
-      }
-
-      // @actorIndependent can not be applied to stored properties, unless if
-      // the 'unsafe' option was specified
-      if (var->hasStorage()) {
-        switch (attr->getKind()) {
-          case ActorIndependentKind::Safe:
-            diagnoseAndRemoveAttr(attr, diag::actorindependent_mutable_storage);
-            return;
-            
-          case ActorIndependentKind::Unsafe:
-            break;
-        }
-      }
-
-      // @actorIndependent can not be applied to local properties.
-      if (dc->isLocalContext()) {
-        diagnoseAndRemoveAttr(attr, diag::actorindependent_local_var);
-        return;
-      }
-
-      // If this is a static or global variable, we're all set.
-      if (dc->isModuleScopeContext() ||
-          (dc->isTypeContext() && var->isStatic())) {
-        return;
-      }
-
-      // Otherwise, fall through to make sure we're in an appropriate
-      // context.
-    }
-
-    // @actorIndependent only makes sense on an actor instance member.
-    if (!dc->getSelfClassDecl() ||
-        !dc->getSelfClassDecl()->isActor()) {
-      diagnoseAndRemoveAttr(attr, diag::actorindependent_not_actor_member);
-      return;
-    }
-
-    auto VD = cast<ValueDecl>(D);
-    if (!VD->isInstanceMember()) {
-      diagnoseAndRemoveAttr(
-          attr, diag::actorindependent_not_actor_instance_member);
-      return;
-    }
-
-    (void)getActorIsolation(VD);
-  }
-
-  void visitGlobalActorAttr(GlobalActorAttr *attr) {
-    auto nominal = dyn_cast<NominalTypeDecl>(D);
-    if (!nominal)
-      return; // already diagnosed
-
-    (void)nominal->isGlobalActor();
-  }
-
-  void visitAsyncAttr(AsyncAttr *attr) {
-    auto var = dyn_cast<VarDecl>(D);
-    if (!var)
-      return;
-
-    auto patternBinding = var->getParentPatternBinding();
-    if (!patternBinding)
-      return; // already diagnosed
-
-    // "Async" modifier can only be applied to local declarations.
-    if (!patternBinding->getDeclContext()->isLocalContext()) {
-      diagnoseAndRemoveAttr(attr, diag::async_let_not_local);
-      return;
-    }
-
-    // Check each of the pattern binding entries.
-    bool diagnosedVar = false;
-    for (unsigned index : range(patternBinding->getNumPatternEntries())) {
-      auto pattern = patternBinding->getPattern(index);
-
-      // Look for variables bound by this pattern.
-      bool foundAnyVariable = false;
-      bool isLet = true;
-      pattern->forEachVariable([&](VarDecl *var) {
-        if (!var->isLet())
-          isLet = false;
-        foundAnyVariable = true;
-      });
-
-      // Each entry must bind at least one named variable, so that there is
-      // something to "await".
-      if (!foundAnyVariable) {
-        diagnose(pattern->getLoc(), diag::async_let_no_variables);
-        attr->setInvalid();
-        return;
-      }
-
-      // Async can only be used on an "async let".
-      if (!isLet && !diagnosedVar) {
-        diagnose(patternBinding->getLoc(), diag::async_not_let)
-          .fixItReplace(patternBinding->getLoc(), "let");
-        diagnosedVar = true;
-      }
-
-      // Each pattern entry must have an initializer expression.
-      if (patternBinding->getEqualLoc(index).isInvalid()) {
-        diagnose(pattern->getLoc(), diag::async_let_not_initialized);
-        attr->setInvalid();
-        return;
-      }
-    }
-  }
+  void visitReasyncAttr(ReasyncAttr *attr);
+  void visitAtReasyncAttr(AtReasyncAttr *attr);
 };
 } // end anonymous namespace
 
@@ -829,14 +712,8 @@ void AttributeChecker::visitLazyAttr(LazyAttr *attr) {
 
   // 'lazy' is not allowed on a global variable or on a static property (which
   // are already lazily initialized).
-  // TODO: we can't currently support lazy properties on non-type-contexts.
-  if (VD->isStatic() ||
-      (varDC->isModuleScopeContext() &&
-       !varDC->getParentSourceFile()->isScriptMode())) {
+  if (VD->isStatic() || varDC->isModuleScopeContext())
     diagnoseAndRemoveAttr(attr, diag::lazy_on_already_lazy_global);
-  } else if (!VD->getDeclContext()->isTypeContext()) {
-    diagnoseAndRemoveAttr(attr, diag::lazy_must_be_property);
-  }
 }
 
 bool AttributeChecker::visitAbstractAccessControlAttr(
@@ -1030,6 +907,21 @@ void AttributeChecker::visitSPIAccessControlAttr(SPIAccessControlAttr *attr) {
       }
     }
   }
+
+  if (auto ID = dyn_cast<ImportDecl>(D)) {
+    auto importedModule = ID->getModule();
+    if (importedModule) {
+      auto path = importedModule->getModuleFilename();
+      if (llvm::sys::path::extension(path) == ".swiftinterface" &&
+          !path.endswith(".private.swiftinterface")) {
+        // If the module was built from the public swiftinterface, it can't
+        // have any SPI.
+        diagnose(attr->getLocation(),
+                 diag::spi_attribute_on_import_of_public_module,
+                 importedModule->getName(), path);
+      }
+    }
+  }
 }
 
 static bool checkObjCDeclContext(Decl *D) {
@@ -1051,25 +943,25 @@ static void diagnoseObjCAttrWithoutFoundation(ObjCAttr *attr, Decl *decl) {
     return;
 
   auto &ctx = SF->getASTContext();
-  if (ctx.LangOpts.EnableObjCInterop) {
-    // Don't diagnose in a SIL file.
-    if (SF->Kind == SourceFileKind::SIL)
-      return;
 
-    // Don't diagnose for -disable-objc-attr-requires-foundation-module.
-    if (!ctx.LangOpts.EnableObjCAttrRequiresFoundation)
-      return;
+  if (!ctx.LangOpts.EnableObjCInterop) {
+    ctx.Diags.diagnose(attr->getLocation(), diag::objc_interop_disabled)
+      .fixItRemove(attr->getRangeWithAt());
+    return;
   }
+
+  // Don't diagnose in a SIL file.
+  if (SF->Kind == SourceFileKind::SIL)
+    return;
+
+  // Don't diagnose for -disable-objc-attr-requires-foundation-module.
+  if (!ctx.LangOpts.EnableObjCAttrRequiresFoundation)
+    return;
 
   // If we have the Foundation module, @objc is okay.
   auto *foundation = ctx.getLoadedModule(ctx.Id_Foundation);
   if (foundation && ctx.getImportCache().isImportedBy(foundation, SF))
     return;
-
-  if (!ctx.LangOpts.EnableObjCInterop) {
-    ctx.Diags.diagnose(attr->getLocation(), diag::objc_interop_disabled)
-      .fixItRemove(attr->getRangeWithAt());
-  }
 
   ctx.Diags.diagnose(attr->getLocation(),
                      diag::attr_used_without_required_module, attr,
@@ -1160,8 +1052,11 @@ void AttributeChecker::visitObjCAttr(ObjCAttr *attr) {
         if (CD->isObjCZeroParameterWithLongSelector())
           numParameters = 0;  // Something like "init(foo: ())"
 
-      // A throwing method has an error parameter.
-      if (func->hasThrows())
+      // An async method, even if it is also 'throws', has
+      // one additional completion handler parameter in ObjC.
+      if (func->hasAsync())
+        ++numParameters;
+      else if (func->hasThrows()) // A throwing method has an error parameter.
         ++numParameters;
 
       unsigned numArgumentNames = objcName->getNumArgs();
@@ -1930,21 +1825,44 @@ synthesizeMainBody(AbstractFunctionDecl *fn, void *arg) {
 
   auto *callExpr = CallExpr::createImplicit(context, memberRefExpr, {}, {});
   callExpr->setImplicit(true);
-  callExpr->setThrows(mainFunction->hasThrows());
   callExpr->setType(context.TheEmptyTupleType);
 
   Expr *returnedExpr;
 
-  if (mainFunction->hasThrows()) {
+  if (mainFunction->hasAsync()) {
+    // Pass main into _runAsyncMain(_ asyncFunc: () async throws -> ())
+    // Resulting $main looks like:
+    // $main() { _runAsyncMain(main) }
+    auto *concurrencyModule = context.getLoadedModule(context.Id_Concurrency);
+    assert(concurrencyModule != nullptr && "Failed to find Concurrency module");
+
+    SmallVector<ValueDecl *, 1> decls;
+    concurrencyModule->lookupQualified(
+        concurrencyModule,
+        DeclNameRef(context.getIdentifier("_runAsyncMain")),
+        NL_QualifiedDefault | NL_IncludeUsableFromInline,
+        decls);
+    assert(!decls.empty() && "Failed to find _runAsyncMain");
+    FuncDecl *runner = cast<FuncDecl>(decls[0]);
+
+    auto asyncRunnerDeclRef = ConcreteDeclRef(runner, substitutionMap);
+
+    DeclRefExpr *funcExpr = new (context) DeclRefExpr(asyncRunnerDeclRef,
+                                                      DeclNameLoc(),
+                                                      /*implicit=*/true);
+    funcExpr->setType(runner->getInterfaceType());
+    auto *callExpr = CallExpr::createImplicit(context, funcExpr, memberRefExpr, {});
+    returnedExpr = callExpr;
+  } else if (mainFunction->hasThrows()) {
     auto *tryExpr = new (context) TryExpr(
-        SourceLoc(), callExpr, context.TheEmptyTupleType, /*implicit=*/true);
+        callExpr->getLoc(), callExpr, context.TheEmptyTupleType, /*implicit=*/true);
     returnedExpr = tryExpr;
   } else {
     returnedExpr = callExpr;
   }
 
   auto *returnStmt =
-      new (context) ReturnStmt(SourceLoc(), callExpr, /*Implicit=*/true);
+      new (context) ReturnStmt(SourceLoc(), returnedExpr, /*Implicit=*/true);
 
   SmallVector<ASTNode, 1> stmts;
   stmts.push_back(returnStmt);
@@ -2134,43 +2052,20 @@ void AttributeChecker::visitRequiredAttr(RequiredAttr *attr) {
   }
 }
 
-static bool hasThrowingFunctionParameter(CanType type) {
-  // Only consider throwing function types.
-  if (auto fnType = dyn_cast<AnyFunctionType>(type)) {
-    return fnType->getExtInfo().isThrowing();
-  }
-
-  // Look through tuples.
-  if (auto tuple = dyn_cast<TupleType>(type)) {
-    for (auto eltType : tuple.getElementTypes()) {
-      if (hasThrowingFunctionParameter(eltType))
-        return true;
-    }
-    return false;
-  }
-
-  // Suppress diagnostics in the presence of errors.
-  if (type->hasError()) {
-    return true;
-  }
-
-  return false;
-}
-
 void AttributeChecker::visitRethrowsAttr(RethrowsAttr *attr) {
   // 'rethrows' only applies to functions that take throwing functions
   // as parameters.
-  auto fn = cast<AbstractFunctionDecl>(D);
-  for (auto param : *fn->getParameters()) {
-    if (hasThrowingFunctionParameter(param->getType()
-            ->lookThroughAllOptionalTypes()
-            ->getCanonicalType()))
-      return;
+  auto fn = dyn_cast<AbstractFunctionDecl>(D);
+  if (fn->getPolymorphicEffectKind(EffectKind::Throws)
+        != PolymorphicEffectKind::Invalid) {
+    return;
   }
 
   diagnose(attr->getLocation(), diag::rethrows_without_throwing_parameter);
   attr->setInvalid();
 }
+
+void AttributeChecker::visitAtRethrowsAttr(AtRethrowsAttr *attr) {}
 
 /// Collect all used generic parameter types from a given type.
 static void collectUsedGenericParameters(
@@ -4310,11 +4205,10 @@ resolveDifferentiableAttrOriginalFunction(DifferentiableAttr *attr) {
     }
   }
   // Non-`get` accessors are not yet supported: `set`, `read`, and `modify`.
-  // TODO(TF-129): Enable `set` when differentiation supports inout parameters.
   // TODO(TF-1080): Enable `read` and `modify` when differentiation supports
   // coroutines.
   if (auto *accessor = dyn_cast_or_null<AccessorDecl>(original))
-    if (!accessor->isGetter())
+    if (!accessor->isGetter() && !accessor->isSetter())
       original = nullptr;
   // Diagnose if original `AbstractFunctionDecl` could not be resolved.
   if (!original) {
@@ -4642,7 +4536,7 @@ IndexSubset *DifferentiableAttributeTypeCheckRequest::evaluate(
     auto *getterDecl = asd->getOpaqueAccessor(AccessorKind::Get);
     auto *newAttr = DifferentiableAttr::create(
         getterDecl, /*implicit*/ true, attr->AtLoc, attr->getRange(),
-        attr->isLinear(), resolvedDiffParamIndices,
+        attr->getDifferentiabilityKind(), resolvedDiffParamIndices,
         attr->getDerivativeGenericSignature());
     auto insertion = ctx.DifferentiableAttrs.try_emplace(
         {getterDecl, resolvedDiffParamIndices}, newAttr);
@@ -5425,3 +5319,160 @@ void AttributeChecker::visitTransposeAttr(TransposeAttr *attr) {
   // Set the resolved linearity parameter indices in the attribute.
   attr->setParameterIndices(linearParamIndices);
 }
+
+void AttributeChecker::visitAsyncHandlerAttr(AsyncHandlerAttr *attr) {
+  auto func = dyn_cast<FuncDecl>(D);
+  if (!func) {
+    diagnoseAndRemoveAttr(attr, diag::asynchandler_non_func);
+    return;
+  }
+
+  // Trigger the request to check for @asyncHandler.
+  (void)func->isAsyncHandler();
+}
+
+void AttributeChecker::visitActorAttr(ActorAttr *attr) {
+  auto classDecl = dyn_cast<ClassDecl>(D);
+  if (!classDecl)
+    return; // already diagnosed
+
+  (void)classDecl->isActor();
+}
+
+void AttributeChecker::visitActorIndependentAttr(ActorIndependentAttr *attr) {
+  // @actorIndependent can be applied to global and static/class variables
+  // that do not have storage.
+  auto dc = D->getDeclContext();
+  if (auto var = dyn_cast<VarDecl>(D)) {
+    // @actorIndependent is meaningless on a `let`.
+    if (var->isLet()) {
+      diagnoseAndRemoveAttr(attr, diag::actorindependent_let);
+      return;
+    }
+
+    // @actorIndependent can not be applied to stored properties, unless if
+    // the 'unsafe' option was specified
+    if (var->hasStorage()) {
+      switch (attr->getKind()) {
+        case ActorIndependentKind::Safe:
+          diagnoseAndRemoveAttr(attr, diag::actorindependent_mutable_storage);
+          return;
+
+        case ActorIndependentKind::Unsafe:
+          break;
+      }
+    }
+
+    // @actorIndependent can not be applied to local properties.
+    if (dc->isLocalContext()) {
+      diagnoseAndRemoveAttr(attr, diag::actorindependent_local_var);
+      return;
+    }
+
+    // If this is a static or global variable, we're all set.
+    if (dc->isModuleScopeContext() ||
+        (dc->isTypeContext() && var->isStatic())) {
+      return;
+    }
+  }
+
+  if (auto VD = dyn_cast<ValueDecl>(D)) {
+    (void)getActorIsolation(VD);
+  }
+}
+
+void AttributeChecker::visitGlobalActorAttr(GlobalActorAttr *attr) {
+  auto nominal = dyn_cast<NominalTypeDecl>(D);
+  if (!nominal)
+    return; // already diagnosed
+
+  (void)nominal->isGlobalActor();
+}
+
+void AttributeChecker::visitAsyncAttr(AsyncAttr *attr) {
+  auto var = dyn_cast<VarDecl>(D);
+  if (!var)
+    return;
+
+  auto patternBinding = var->getParentPatternBinding();
+  if (!patternBinding)
+    return; // already diagnosed
+
+  // "Async" modifier can only be applied to local declarations.
+  if (!patternBinding->getDeclContext()->isLocalContext()) {
+    diagnoseAndRemoveAttr(attr, diag::async_let_not_local);
+    return;
+  }
+
+  // Check each of the pattern binding entries.
+  bool diagnosedVar = false;
+  for (unsigned index : range(patternBinding->getNumPatternEntries())) {
+    auto pattern = patternBinding->getPattern(index);
+
+    // Look for variables bound by this pattern.
+    bool foundAnyVariable = false;
+    bool isLet = true;
+    pattern->forEachVariable([&](VarDecl *var) {
+      if (!var->isLet())
+        isLet = false;
+      foundAnyVariable = true;
+    });
+
+    // Each entry must bind at least one named variable, so that there is
+    // something to "await".
+    if (!foundAnyVariable) {
+      diagnose(pattern->getLoc(), diag::async_let_no_variables);
+      attr->setInvalid();
+      return;
+    }
+
+    // Async can only be used on an "async let".
+    if (!isLet && !diagnosedVar) {
+      diagnose(patternBinding->getLoc(), diag::async_not_let)
+        .fixItReplace(patternBinding->getLoc(), "let");
+      diagnosedVar = true;
+    }
+
+    // Each pattern entry must have an initializer expression.
+    if (patternBinding->getEqualLoc(index).isInvalid()) {
+      diagnose(pattern->getLoc(), diag::async_let_not_initialized);
+      attr->setInvalid();
+      return;
+    }
+  }
+}
+
+void AttributeChecker::visitMarkerAttr(MarkerAttr *attr) {
+  auto proto = dyn_cast<ProtocolDecl>(D);
+  if (!proto)
+    return;
+
+  // A marker protocol cannot inherit a non-marker protocol.
+  for (auto inheritedProto : proto->getInheritedProtocols()) {
+    if (!inheritedProto->isMarkerProtocol()) {
+      proto->diagnose(
+          diag::marker_protocol_inherit_nonmarker,
+          proto->getName(), inheritedProto->getName());
+      inheritedProto->diagnose(
+          diag::decl_declared_here, inheritedProto->getName());
+    }
+  }
+
+  // A marker protocol cannot have any requirements.
+  for (auto member : proto->getAllMembers()) {
+    auto value = dyn_cast<ValueDecl>(member);
+    if (!value)
+      continue;
+
+    if (value->isProtocolRequirement()) {
+      value->diagnose(diag::marker_protocol_requirement, proto->getName());
+      break;
+    }
+  }
+}
+
+void AttributeChecker::visitReasyncAttr(ReasyncAttr *attr) {
+  // FIXME
+}
+
+void AttributeChecker::visitAtReasyncAttr(AtReasyncAttr *attr) {}

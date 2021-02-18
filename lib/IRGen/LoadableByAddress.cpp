@@ -1388,7 +1388,7 @@ SILArgument *LoadableStorageAllocation::replaceArgType(SILBuilder &argBuilder,
                    arg) == pass.largeLoadableArgs.end());
 
   arg = arg->getParent()->replaceFunctionArgument(
-      arg->getIndex(), newSILType, ValueOwnershipKind::None, arg->getDecl());
+      arg->getIndex(), newSILType, OwnershipKind::None, arg->getDecl());
 
   for (auto *use : useList) {
     use->set(arg);
@@ -1418,7 +1418,7 @@ void LoadableStorageAllocation::insertIndirectReturnArgs() {
       pass.F->getDeclContext());
   var->setSpecifier(ParamSpecifier::InOut);
   pass.F->begin()->insertFunctionArgument(
-      0, newResultStorageType.getAddressType(), ValueOwnershipKind::None, var);
+      0, newResultStorageType.getAddressType(), OwnershipKind::None, var);
 }
 
 void LoadableStorageAllocation::convertIndirectFunctionArgs() {
@@ -2287,7 +2287,7 @@ static void rewriteFunction(StructLoweringState &pass,
   while (!pass.modReturnInsts.empty()) {
     auto *instr = pass.modReturnInsts.pop_back_val();
     auto loc = instr->getLoc(); // SILLocation::RegularKind
-    auto regLoc = RegularLocation(loc.getSourceLoc());
+    auto regLoc = RegularLocation(loc);
     SILBuilderWithScope retBuilder(instr);
     assert(modNonFuncTypeResultType(pass.F, pass.Mod) &&
            "Expected a regular type");
@@ -2765,7 +2765,8 @@ bool LoadableByAddress::recreateTupleInstr(
   for (auto elem : tupleInstr->getElements()) {
     elems.push_back(elem);
   }
-  auto *newTuple = tupleBuilder.createTuple(tupleInstr->getLoc(), elems);
+  auto *newTuple = tupleBuilder.createTuple(tupleInstr->getLoc(), newResultTy,
+                                            elems);
   tupleInstr->replaceAllUsesWith(newTuple);
   Delete.push_back(tupleInstr);
   return true;

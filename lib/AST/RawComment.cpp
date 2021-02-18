@@ -22,6 +22,7 @@
 #include "swift/AST/FileUnit.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/Basic/SourceManager.h"
@@ -153,7 +154,14 @@ RawComment Decl::getRawComment(bool SerializedOK) const {
         if (!CachedLocs->DocRanges.empty()) {
           SmallVector<SingleRawComment, 4> SRCs;
           for (const auto &Range : CachedLocs->DocRanges) {
-            SRCs.push_back({ Range, Context.SourceMgr });
+            if (Range.isValid()) {
+              SRCs.push_back({ Range, Context.SourceMgr });
+            } else {
+              // if we've run into an invalid range, don't bother trying to load any of
+              // the other comments
+              SRCs.clear();
+              break;
+            }
           }
           auto RC = RawComment(Context.AllocateCopy(llvm::makeArrayRef(SRCs)));
 
@@ -237,4 +245,28 @@ CharSourceRange RawComment::getCharSourceRange() {
   auto Length = static_cast<const char *>(End.getOpaquePointerValue()) -
                 static_cast<const char *>(Start.getOpaquePointerValue());
   return CharSourceRange(Start, Length);
+}
+
+bool BasicSourceFileInfo::populate(const SourceFile *SF) {
+  SourceManager &SM = SF->getASTContext().SourceMgr;
+
+  auto filename = SF->getFilename();
+  if (filename.empty())
+    return true;
+  auto stat = SM.getFileSystem()->status(filename);
+  if (!stat)
+    return true;
+
+  FilePath = filename;
+  LastModified = stat->getLastModificationTime();
+  FileSize = stat->getSize();
+
+  if (SF->hasInterfaceHash()) {
+    InterfaceHash = SF->getInterfaceHashIncludingTypeMembers();
+  } else {
+    // FIXME: Parse the file with EnableInterfaceHash option.
+    InterfaceHash = Fingerprint::ZERO();
+  }
+
+  return false;
 }

@@ -58,7 +58,7 @@ macro(swift_common_standalone_build_config_llvm product)
     fix_imported_targets_for_xcode("${LLVM_EXPORTED_TARGETS}")
   endif()
 
-  if(NOT CMAKE_CROSSCOMPILING AND NOT SWIFT_CROSS_COMPILING)
+  if(NOT CMAKE_CROSSCOMPILING)
     set(${product}_NATIVE_LLVM_TOOLS_PATH "${LLVM_TOOLS_BINARY_DIR}")
   endif()
 
@@ -95,6 +95,10 @@ macro(swift_common_standalone_build_config_llvm product)
         endif()
       endif()
     endif()
+  endif()
+
+  if(LLVM_ENABLE_ZLIB)
+   find_package(ZLIB REQUIRED)
   endif()
 
   include(AddLLVM)
@@ -159,7 +163,7 @@ endmacro()
 macro(swift_common_standalone_build_config_clang product)
   find_package(Clang CONFIG REQUIRED NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
 
-  if (NOT CMAKE_CROSSCOMPILING)
+  if (NOT CMAKE_CROSSCOMPILING AND NOT SWIFT_PREBUILT_CLANG)
     set(${product}_NATIVE_CLANG_TOOLS_PATH "${LLVM_TOOLS_BINARY_DIR}")
   endif()
 
