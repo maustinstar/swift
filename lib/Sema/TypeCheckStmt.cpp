@@ -2092,9 +2092,6 @@ bool TypeChecker::typeCheckClosureBody(ClosureExpr *closure) {
   }
   closure->setBodyState(ClosureExpr::BodyState::SeparatelyTypeChecked);
   
-  if (!HadError)
-    performClosureBodyDiagnostics(closure);
-  
   return HadError;
 }
 
@@ -2118,7 +2115,6 @@ void TypeChecker::typeCheckTopLevelCodeDecl(TopLevelCodeDecl *TLCD) {
   TLCD->setBody(Body);
   checkTopLevelActorIsolation(TLCD);
   checkTopLevelEffects(TLCD);
-  performTopLevelDeclDiagnostics(TLCD);
 }
 
 void swift::checkUnknownAttrRestrictions(
