@@ -67,7 +67,7 @@ func escapedDollarAnd() {
 // declarations.
 
 func $declareWithDollar() { // expected-error{{cannot declare entity named '$declareWithDollar'}}
-var $foo: Int { // expected-error{{cannot declare entity named '$foo'}}
+  var $foo: Int { // expected-error{{cannot declare entity named '$foo'}}
     get { 0 }
     set($value) {} // expected-error{{cannot declare entity named '$value'}}
   }
